@@ -56,7 +56,7 @@ def main() -> int:
                     request_delay=settings.request_delay,
                 )
                 
-                # Парсинг базовых цен
+                # Парсинг базовых цен (читает артикулы из Articles.xlsx)
                 basic_prices = parser.parse_basic_prices()
                 all_results.extend(basic_prices)
                 
