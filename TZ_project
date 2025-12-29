@@ -1,0 +1,1057 @@
+Техническое задание (ТЗ) — Универсальный парсер цен Wildberries (собранный документ)
+Документ — «source of truth» для разработчика. Содержит весь контекст проекта, требования, найденные эндпоинты, XPath, .env-переменные, архитектурную стратегию и пошаговый план реализации MVP. Код не включён — сюда входит только подробное задание и все выводы/заметки, которые у нас есть.
+
+1. Краткий контекст проекта
+Цель: быстро и надёжно собирать финальные цены по товарам Wildberries для аналитики и ручного обновления менеджерами.
+
+
+Объём: ~900 SKU на Wildberries (в дальнейшем — Ozon).
+
+
+Частота обновления: каждые 1–2 часа.
+
+
+Целевое время выполнения для всех SKU: 5–10 минут.
+
+
+Запуск сначала локально, в будущем перенос на сервер.
+
+
+Требование к переносимости: проект должен легко запускаться на другом ПК (минимум ручных действий).
+
+
+
+2. Что нужно получить (строго)
+Для каждого товара собрать и экспортировать в .xlsx (таблица, подробное описание ниже):
+price_basic — цена продавца без скидки (поле JSON price.basic) → делить на 100, хранить как float (рубли).
+
+
+price_product — цена после СПП (чёрная цена, без карты) (поле JSON price.product) → делить на 100.
+
+
+price_card — цена с картой Wildberries (если есть) → искать через internal API или парсить через XPath из HTML карточки/бренд-страницы.
+
+
+name — название товара.
+
+
+article — артикул товара (vendor code / nmId / supplier article).
+
+
+cabinet_id и cabinet_name — откуда пришёл товар (см. таблицу кабинетов).
+
+
+source — пометка, откуда взята каждая цена: api-json / xpath-html / api-internal-other.
+
+
+product_url (если есть) — ссылка на карточку/страницу товара.
+
+
+
+3. Кабинеты продавцов (фиксированные ID)
+Использовать точно такое сопоставление (обязательно включить в отчёт cabinet_name и cabinet_id):
+MAU → 53607
+
+
+MAB → 121614
+
+
+MMA → 174711
+
+
+cosmo → 224650
+
+
+dreamlab → 1140223
+
+
+beautylab → 4428365
+
+
+
+4. Ключевая находка (вставить в документацию/лог)
+Ты нашёл внутренний JSON-эндпоинт, который возвращает объект price:
+price: { basic: 97300, product: 43200, logistics: 0, return: 0 }
+basic: 97300
+product: 43200
+
+43200 → означает 432.00 руб. (делить на 100 — конвертация).
+
+
+Пример URL:
+
+
+https://www.wildberries.ru/__internal/catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=68941&curr=rub&dest=-1257786&hide_dtype=...&lang=ru&page=1&sort=popular&spp=30&uclusters=1
+
+DOM/XPath для цены с картой:
+
+
+//article[contains(@class, 'product-card')]  # карточки
+.//del[contains(@class, "price")]            # старая цена
+.//ins[contains(@class, "price")]            # текущая цена
+.//span[contains(@class, "price-card")]      # цена с картой
+
+
+
+5. Выводы и стратегия (быстро и прагматично)
+Primary source — internal JSON endpoint.
+ Это основной источник: быстрый, структурированный JSON с price.basic и price.product. Использовать как главный источник цен (наиболее быстрый и надёжный).
+
+
+Fallback / доп. источник — XPath-парсинг карточек.
+ Для price_card (цена с картой), если её нет в JSON, парсить HTML карточки бренда/товара (XPath). XPath используется только для price_card.
+
+
+Цена после СПП (чёрная).
+ price.product вероятно уже соответствует этой цене. Нужно проверить на выборке товаров: сравнить price.product и DOM-вывод (ins / текущая цена). Если product ≠ чёрная цена на DOM, искать другой internal endpoint или тестировать параметры (например spp, dest), которые влияют на выдачу.
+
+
+Мэппинг JSON ↔ DOM необходим.
+ Выяснить, как id в JSON (например 440587725) соотносится с DOM id (c140347042): через nmId, cardId, keyForUrl или другие поля. Одноразово сопоставить 20–50 товаров, зафиксировать правило мэппинга.
+
+
+Параметры запроса имеют значение.
+ Параметры spp (влияет на СПП?), dest (регион / ПВЗ) и curr должны быть использованы для эмуляции нужного покупателя (цены видимые для конкретного ПВЗ). В MVP dest использовать как в найденном примере (-1257786) и проверить чувствительность.
+
+
+
+6. Входные параметры / .env (включить в проект)
+Включить файл .env (пример ниже должен быть включён в репозиторий как .env.example и читать в config.py).
+# API-ключи (если понадобятся для seller API)
+WB_API_KEY_MAU=your_api_key_here
+WB_API_KEY_MAB=your_api_key_here
+WB_API_KEY_MMA=your_api_key_here
+WB_API_KEY_COSMO=your_api_key_here
+WB_API_KEY_DREAMLAB=your_api_key_here
+WB_API_KEY_BEAUTYLAB=your_api_key_here
+
+# ID кабинетов WB
+WB_CABINET_MAU_ID=53607
+WB_CABINET_MAB_ID=121614
+WB_CABINET_MMA_ID=174711
+WB_CABINET_COSMO_ID=224650
+WB_CABINET_DREAMLAB_ID=1140223
+WB_CABINET_BEAUTYLAB_ID=4428365
+
+# Бренд и параметры парсинга (пример)
+WB_BRAND_ID=68941
+WB_DEST=-1257786
+WB_SPP=30
+
+# Выход
+OUTPUT_FILE=wb_prices.xlsx
+CONCURRENCY=40   # примерное значение, конфигурируемо
+
+
+7. Архитектура пайплайна (высокоуровнево)
+Config: читает .env.
+
+
+Discovery (однократно / периодически):
+
+
+вызывается DevTools/mitmproxy/просмотр JSON, чтобы подтвердить endpoint и мэппинг id ↔ DOM.
+
+
+логирует примеры для регресс-тестов.
+
+
+Fetcher (async HTTP pool):
+
+
+батчевые async-запросы к __internal/catalog/brands/v4/catalog по страницам; собирает JSON.
+
+
+парсит price.basic, price.product, id, nmId, name, product_url (если есть).
+
+
+Mapper: сопоставляет JSON-ид → DOM-ид (если нужно получить price_card через HTML).
+
+
+Fallback fetcher (HTML XPath):
+
+
+по необходимости (только для price_card), парсит бренд-страницу / карточки с минимальным количеством запросов.
+
+
+Export: сохраняет .xlsx с колонками, source и метаданными.
+
+
+Monitoring / error handling: логировать 4xx/5xx, уменьшать concurrency при ошибках, retries с backoff.
+
+
+
+8. Конкретные шаги разработки (пошагово для исполнителя)
+Шаг 0 — Подготовка репозитория
+Создать репозиторий с README.md, .env.example, requirements.txt.
+
+
+Структура проекта (рекомендованная):
+
+
+wb_price_parser/
+├─ src/
+│  ├─ main.py
+│  ├─ config.py
+│  ├─ fetcher.py
+│  ├─ xpath_parser.py
+│  ├─ mapper.py
+│  ├─ exporter.py
+│  └─ utils.py
+├─ .env.example
+└─ requirements.txt
+
+
+Шаг 1 — Конфигурация
+Реализовать config.py, который читает .env (использовать python-dotenv).
+
+
+Значения: WB_BRAND_ID, WB_DEST, WB_SPP, CONCURRENCY, OUTPUT_FILE, кабинет-IDs.
+
+
+Шаг 2 — Discovery-скрипт
+Скрипт, который вызовет JSON endpoint page=1..N и сохранит несколько примеров ответов в samples/.
+
+
+Одновременно сохранить HTML страницы соответствующих товаров (для ручной сверки).
+
+
+Результат: файл с сопоставлениями json_id ↔ nmId ↔ product_url ↔ dom_id.
+
+
+Шаг 3 — Основной fetcher (async)
+Асинхронный модуль fetcher.py, который:
+
+
+Батчит страницы JSON brand catalog.
+
+
+Собирает список товаров (id, nmId, name, price.basic, price.product, product_url).
+
+
+Конвертирует basic и product /100 в рубли.
+
+
+Шаг 4 — Mapper
+Используя результаты discovery, реализовать функцию, которая по JSON-объекту находит product_url или DOM-ид для последующего XPath (если нужно).
+
+
+Шаг 5 — XPath price-card fetcher (ограниченно)
+Модуль xpath_parser.py:
+
+
+Загружает минимально возможную HTML-страницу (не рендерит JS).
+
+
+Использует lxml и XPath .//span[contains(@class, "price-card")] для получения price_card.
+
+
+Работает только для SKU, у которых price_card не найден в JSON.
+
+
+Конкурентность для HTML-запросов должна быть ниже, чем для JSON (например CONCURRENCY_HTML=5).
+
+
+Шаг 6 — Exporter
+exporter.py сохраняет данные в .xlsx (колонки как в ТЗ), также записывать source (api-json / xpath-html) и timestamp.
+
+
+Шаг 7 — Тестирование и валидация
+Написать unit/integration тесты на discovery mapping (сохранённые JSON-образцы).
+
+
+Проверить 50 SKU вручную: сравнить price.product и DOM-цены (ins / price-card).
+
+
+Проверить, что конвертация /100 корректна для всех цен.
+
+
+Шаг 8 — Документация и переносимость
+README.md с инструкцией:
+
+
+pip install -r requirements.txt
+
+
+заполнить .env
+
+
+python -m src.main
+
+
+.env.example включён, никаких секретов в репо.
+
+
+
+9. Ограничения, риски и способы их минимизации
+Риск: изменения внутреннего API / структуры JSON
+Митигейшн: хранить samples/ и unit-tests, раз в неделю проверять health (smoke test) на 10 SKU.
+
+
+Риск: rate-limits / блокировка
+Митигейшн: параметризуемая concurrency, retry/backoff, опционально подключаем прокси пул в будущем.
+
+
+Риск: несоответствие price.product и DOM-чёрной цены
+Митигейшн: ручная сверка (50 товаров) и поиск другого internal endpoint (если mismatch).
+
+
+Риск: price_card отсутствует в JSON
+Митигейшн: XPath fallback (минимизировать HTML-запросы).
+
+
+
+10. Формат итоговой выгрузки (.xlsx)
+Колонки (обязательные):
+cabinet_name
+
+
+cabinet_id
+
+
+article
+
+
+name
+
+
+price_basic (float, руб.)
+
+
+price_product (float, руб.)
+
+
+price_card (float, руб. or null)
+
+
+source_price_basic (api-json)
+
+
+source_price_product (api-json)
+
+
+source_price_card (api-json / xpath-html)
+
+
+product_url
+
+
+timestamp (UTC)
+
+
+
+11. Критерии приёмки (Definition of Done)
+Проект запускается на чистой машине за 5 минут (после pip install -r requirements.txt и заполнения .env).
+
+
+Генерируется .xlsx с корректными значениями для 100 тестовых SKU (время выполнения ≤ 10 минут по 900 SKU — проверяется нагрузочным тестом).
+
+
+Для каждой цены указан source. price_basic и price_product заполнены из JSON.
+
+
+price_card заполнен, если есть в JSON или в результате XPath (приставка source_price_card соответствует).
+
+
+Документ и codebase имеют README.md с инструкциями по запуску.
+
+
+
+12. Дополнительные указания для разработчика (best practices)
+Конфигурация через .env (никаких хардкодов).
+
+
+Строгое логирование ошибок (файлы logs/), но без утечек ключей.
+
+
+Использовать asyncio/aiohttp или Node.js axios+Promise, но асинхронность обязательна.
+
+
+Везде обрабатывать исключения: timeouts, 4xx/5xx.
+
+
+Версионировать requirements.txt (фиксировать версии).
+
+
+Сделать небольшой health-check endpoint/script, который проверяет корректность API-ответов.
+
+
+
+13. Регламент discovery (оперативная инструкция)
+Выполнить запрос к JSON endpoint (page=1). Сохранить ответ в samples/json_page_1.json.
+
+
+Из JSON взять первые 30 элементов: сохранить id, nmId, name, price.basic, price.product, link/slug (если есть).
+
+
+В браузере открыть бренд-страницу и для 10 товаров найти DOM-элемент article.product-card и извлечь data-* атрибуты и ins/span.price-card.
+
+
+Сопоставить nmId / id → product_url / dom_id. Зафиксировать правило в mapper/README.
+
+
+Если price.product ≠ DOM чёрной цены → искать дополнительные API-запросы (из DevTools: сетевые XHR при переключении spp/dest, кликах на карточку) и логировать их.
+
+
+
+14. Открытые вопросы (фиксировать в issue tracker)
+Для 6 кабинетов: какие именно brand IDs/фильтры использовать для каждого cabinet? (нужно таблицу mapping если разные brand ID).
+
+
+Есть ли у нас авторизация/сессии, которые необходимо учитывать для получения цен, специфичных для кабинетов?
+
+
+Нужно ли учитывать складские остатки или прочие опциональные поля сейчас?
+
+
+Нужна ли поддержка нескольких dest (ПВЗ) для сравнения цен по регионам?
+
+
+(эти вопросы фиксируются и обрабатываются после initial discovery)
+
+15. Сухое понятное саммари
+Primary source: internal JSON endpoint (__internal/catalog/brands/v4/catalog) — содержит price.basic и price.product (делить на 100).
+
+
+Fallback для price_card: XPath .//span[contains(@class,"price-card")] на бренд-странице / карточке.
+
+
+Нужные поля: name, article, price_basic, price_product, price_card, cabinet_id/name.
+
+
+Кабинеты: MAU(53607), MAB(121614), MMA(174711), cosmo(224650), dreamlab(1140223), beautylab(4428365).
+
+
+Требование: универсальный, переносимый, асинхронный Python-проект с .env конфигурацией и экспортом в .xlsx.
+
+
+Следующий шаг: выполнить discovery (сохранить примеры JSON + HTML и сопоставить id↔DOM), затем реализовать async pipeline + ограниченный XPath fallback.
+.//span[contains(@class, "price-card")]
+
+Примеры XPath из карточки:
+
+
+//*[@id="c140347042"]/div/div[3]/div/span[1]/span/ins
+
+Парсер карточек (существующие шаблоны):
+
+
+
+Ключевые выводы и контекст проекта
+Основная задача: разработать быстрый, надёжный и переносимый парсер цен Wildberries (MVP), который возвращает итоговую цену для каждого товара в формате .xlsx.
+
+
+Источник цен:
+
+
+Primary: внутренний JSON-эндпоинт WB: https://www.wildberries.ru/__internal/catalog/brands/v4/catalog
+
+
+Поля price.basic и price.product (цены в копейках, делим на 100 для рублей).
+
+
+Дополнительно: цена с картой Wildberries (price-card) через:
+
+
+внутренний endpoint (для price_card, если доступен в JSON)
+
+
+либо XPath-парсинг HTML-страницы бренда/товара (например, бренд-страницы). XPath: .//span[contains(@class, "price-card")]
+
+
+Примеры карточек и XPaths приведены в вашем ТЗ.
+
+
+Кабинеты продавцов (12 регистровых значений, на 6 кабинетов):
+ MAU → 53607
+ MAB → 121614
+ MMA → 174711
+ cosmo → 224650
+ dreamlab → 1140223
+ beautylab → 4428365
+ В коде должны быть поля cabinet_id (число) и cabinet_name (строка): MAU, MAB, MMA, cosmo, dreamlab, beautylab.
+
+
+Архитектура и требования к коду:
+
+
+Асинхронная реализация на Python 3.10+ с aiohttp/asyncio.
+
+
+Не использовать Selenium, Playwright, браузеры, GUI.
+
+
+Не полагаться на браузерную автоматизацию.
+
+
+Результат экспорта: .xlsx с колонками, соответствующими формату из ТЗ.
+
+
+Конфигурация через .env; минимальные требования к окружению; простота переноса на другой ПК или на сервер.
+
+
+Весь код должен быть максимально модульным: API-поиск, маппинг, парсинг DOM, экспорт, логирование и тестирование отдельно.
+
+
+Формат выдачи и структура проекта:
+
+
+ТЗ требует четкой структуры, примеры файлов и модулей, включая main.py, config.py, wb_api.py, wb_xpath.py, models.py, exporter.py.
+
+
+Принципы: не хардкодить параметры brand, dest, spp; параметры должны браться из .env.
+
+
+Важные входные параметры и конфигурация (.env):
+ WB_BRAND_ID, WB_DEST, WB_SPP, OUTPUT_FILE, CONCURRENCY, и IDs кабинетов.
+ Также пример ключей WB_API_KEY_* для каждого кабинета (если понадобятся API-ключи).
+
+
+Формат итогового файла .xlsx:
+ Должны быть столбцы:
+ cabinet_name
+ cabinet_id
+ article
+ name
+ price_basic
+ price_product
+ price_card
+ source_price_basic
+ source_price_product
+ source_price_card
+ product_url
+ timestamp
+
+
+План тестирования:
+
+
+Discovery: проверить соответствие JSON полям price.basic и price.product; собрать пару сотен примеров сопоставления id ↔ nmId ↔ product_url ↔ dom_id.
+
+
+MVP: проверить корректность расчета цен (дәре по 100) и соответствие значения price_basic и price_product в экспортируемом файле.
+
+
+Проверить работу fallback для price_card через XPath на 50 тестовых SKU.
+
+
+Обеспечить время выполнения: 5–10 минут для 900 SKU на локальном ПК, ≤10 минут на полную выгрузку.
+
+
+Риски и меры:
+
+
+Изменения API/структуры JSON: хранить samples/ и unit-тесты; периодически проверять health-check.
+
+
+Блокировки/тайм-ауты: лимитирование concurrency, ретраи с backoff, возможная поддержка прокси в будущем.
+
+
+Несоответствие цены price.product и DOM-цены: провести сравнение на выборке, при необходимости расширить механизм маппинга и поиск дополнительных эндпоинтов.
+
+
+Техническое задание (ТЗ) — Универсальный парсер цен Wildberries (собранный документ)
+ Документ — «source of truth» для разработчика. Здесь описаны требования, эндпоинты, XPath, .env, архитектура и пошаговый план реализации MVP. Код не включён.
+Краткий контекст проекта
+
+
+Цель: быстро и надёжно собирать финальные цены по товарам Wildberries для аналитики и ручного обновления менеджерами.
+
+
+Объём: ~900 SKU на Wildberries, в перспективе — Ozon.
+
+
+Частота обновления: каждые 1–2 часа.
+
+
+Целевое время выполнения для всех SKU: 5–10 минут.
+
+
+Платформа запуска: локально сначала, затем перенос на сервер.
+
+
+Переносимость: проект должен запускаться на любом ПК без сложной настройки.
+
+
+Что нужно получить (строго)
+
+
+Для каждого товара собрать и экспортировать в .xlsx:
+
+
+price_basic — цена продавца без скидки (price.basic из JSON) /100 → float (рубли)
+
+
+price_product — цена после СПП (price.product из JSON) /100 → float (рубли)
+
+
+price_card — цена с картой Wildberries (если есть) через internal API или XPath
+
+
+name — название товара
+
+
+article — артикул товара
+
+
+cabinet_id, cabinet_name — источник (кабинет продавца)
+
+
+source_price_basic, source_price_product, source_price_card — источник цен: api-json / xpath-html / api-internal-other
+
+
+product_url — ссылка на карточку/страницу товара (если есть)
+
+
+Формат файла: XLSX с перечисленными полями, цены — float в рублях.
+
+
+Кабинеты продавцов (фиксированные)
+
+
+MAU → 53607
+
+
+MAB → 121614
+
+
+MMA → 174711
+
+
+cosmo → 224650
+
+
+dreamlab → 1140223
+
+
+beautylab → 4428365
+
+
+Ключевая находка
+
+
+Найден внутренний JSON-эндпоинт возвращающий price: { basic, product, logistics, return }:
+
+
+basic: 97300
+
+
+product: 43200
+
+
+43200 → 432.00 руб. (деление на 100)
+
+
+Пример URL: https://www.wildberries.ru/__internal/catalog/brands/v4/catalog?...brand=68941...
+
+
+DOM/XPath для цены с картой: .//span[contains(@class, "price-card")]
+
+
+Парсер карточек использует:
+
+
+//article[contains(@class, 'product-card')]
+
+
+.//del[contains(@class, "price")]
+
+
+.//ins[contains(@class, "price")]
+
+
+.//span[contains(@class, "price-card")]
+
+
+Выводы и стратегия
+
+
+Primary source: internal JSON endpoint — быстрый и надёжный источник price.basic и price.product.
+
+
+Price_card: fallback через XPath на бренд-странице/карточке.
+
+
+Цена после СПП: price.product, вероятно соответствует цене после скидок; нужно проверить на примерах.
+
+
+Мэппинг JSON ↔ DOM: необходимо сопоставить nmId / id с DOM-идентификаторами (cardId, keyForUrl и пр.) на нескольких десятках товаров. Это нужно для корректного запроса price-card через HTML.
+
+
+Параметры запроса (brand, dest, spp, curr, lang) влияют на выдачу цен; их нужно эмулировать в MVP.
+
+
+Входные параметры / .env
+ Пример .env (для репозитория):
+ WB_API_KEY_MAU=your_api_key_here
+ WB_API_KEY_MAB=your_api_key_here
+ WB_API_KEY_MMA=your_api_key_here
+ WB_API_KEY_COSMO=your_api_key_here
+ WB_API_KEY_DREAMLAB=your_api_key_here
+ WB_API_KEY_BEAUTYLAB=your_api_key_here
+
+
+WB_CABINET_MAU_ID=53607
+ WB_CABINET_MAB_ID=121614
+ WB_CABINET_MMA_ID=174711
+ WB_CABINET_COSMO_ID=224650
+ WB_CABINET_DREAMLAB_ID=1140223
+ WB_CABINET_BEAUTYLAB_ID=4428365
+WB_BRAND_ID=68941
+ WB_DEST=-1257786
+ WB_SPP=30
+OUTPUT_FILE=wb_prices.xlsx
+ CONCURRENCY=40
+Архитектура проекта (обязательная)
+ 7.1 Структура проекта (пример)
+ wb_price_parser/
+ │
+ ├── src/
+ │ ├── main.py # Точка входа
+ │ ├── config.py # Чтение .env
+ │ ├── wb_api.py # Работа с internal API
+ │ ├── wb_xpath.py # Парсинг price-card через XPath
+ │ ├── models.py # Структуры данных
+ │ ├── exporter.py # Экспорт в xlsx
+ │
+ ├── .env.example
+ ├── requirements.txt
+ └── README.md
+
+
+7.2 Технологии
+ Разрешено:
+Python 3.10+
+
+
+aiohttp
+
+
+asyncio
+
+
+lxml
+
+
+openpyxl или pandas
+ Запрещено:
+
+
+Selenium
+
+
+Playwright (кроме будущего discovery)
+
+
+ZennoPoster / BAS
+
+
+GUI / браузеры
+
+
+Конфигурация (.env)
+ Примечания:
+
+
+.env.example должен быть в репозитории; секреты не должны попадать в репо.
+
+
+Все параметры должны подниматься из .env и не жестко кодироваться в коде.
+
+
+Логика работы (пошагово)
+
+
+Загрузить конфигурацию из .env.
+
+
+Асинхронно запросить все страницы JSON бренда через endpoint /catalog (построение батчей по page).
+
+
+Для каждого товара:
+
+
+извлечь name, article / nmId
+
+
+price.basic и price.product (конвертация /100)
+
+
+попытаться получить price_card:
+
+
+если присутствует в JSON — использовать
+
+
+иначе — парсить HTML страницы бренда/товара через XPath
+
+
+добавить cabinet_id и cabinet_name
+
+
+сохранить в .xlsx
+
+
+Формат результата (.xlsx)
+
+
+Колонки:
+ cabinet_name
+ cabinet_id
+ article
+ name
+ price_basic
+ price_product
+ price_card
+ source_price_basic
+ source_price_product
+ source_price_card
+ product_url
+ timestamp
+
+
+Все цены в рублях (float)
+
+
+Критические ошибки (запрещено)
+
+
+Не использовать браузерную автоматизацию
+
+
+Не парсить HTML там, где есть JSON
+
+
+Не делать всё синхронно
+
+
+Не хардкодить brand/dest/spp
+
+
+Не смешивать логику API и XPath в одном файле
+
+
+Что считать успешным результатом
+
+
+Код запускается на новом ПК за 5 минут
+
+
+pip install -r requirements.txt проходит без ошибок
+
+
+.env заполнен; запуск даёт .xlsx
+
+
+Цены совпадают с сайтом WB
+
+
+Полная парсинг ≤ 10 минут для 900 SKU
+
+
+Будущее
+
+
+Перенос на сервер
+
+
+Добавление Ozon
+
+
+Прокси / IP-ротация
+
+
+Планировщик (cron)
+
+
+Регламент discovery (оперативная инструкция)
+
+
+Сделать запрос к JSON endpoint page=1; сохранить sample JSON.
+
+
+Собрать первые 30 элементов: id, nmId, name, price.basic, price.product, link/slug.
+
+
+Открыть бренд-страницу и для 10 товаров найти DOM-элемент article.product-card и извлечь data-* атрибуты и price-card через ins/span.price-card.
+
+
+Сопоставить nmId / id → product_url / dom_id. Зафиксировать правила в mapper.
+
+
+Если price.product != price-card в DOM, искать дополнительные API-запросы и логировать.
+
+
+Открытые вопросы (фиксировать в Issue tracker)
+
+
+Для шести кабинетов: какие brand IDs/фильтры использовать, нужен mapping таблицы.
+
+
+Требуется ли авторизация/сессия для цен конкретных кабинетов?
+
+
+Нужно ли учитывать складские остатки или дополнительные поля сейчас?
+
+
+Нужна ли поддержка нескольких dest (ПВЗ) для сравнения цен по регионам?
+
+
+Сводная идея реализации MVP и идеи по ускорению разработки
+ Идеи по архитектуре и паттернам
+Чистый модульный подход:
+
+
+config.py: загрузка и валидация параметров .env
+
+
+wb_api.py: асинхронный клиент для wb.__internal/catalog/brands/v4/catalog; управление rate limits и retry
+
+
+wb_xpath.py: минималистичный HTML-парсер на основе lxml, только для price-card
+
+
+models.py: data models для товара и цены (валидируемые поля)
+
+
+mapper.py: маппинг между JSON-идентификаторами и DOM-идентификаторами
+
+
+exporter.py: экспорт в XLSX через openpyxl или pandas
+
+
+main.py: orchestrator, запускающий пайплайн, управляет concurrency
+
+
+Подход discovery-first:
+
+
+сначала выполнить discovery-по JSON и HTML, сохранить sample-данные в samples/ (json_page_1.json, и т.д., samples/html/ для карточек)
+
+
+на основе этого зафиксировать правила мэппинга (nmId ↔ dom_id)
+
+
+Подход к приватности и безопасности:
+
+
+.env.example без секретов
+
+
+логи должны содержать данные об ошибках, но не выводить API-ключи
+
+
+Тестирование:
+
+
+unit-тесты на функции конвертации цен: конвертация price.basic/price.product -> рубли
+
+
+integration-тесты на discovery-мэппинг: сравнительная проверка для 20–50 SKU
+
+
+smoke-тесты health-check скрипт, который делает минимальный запрос и валидирует формат ответа
+
+
+Минимальный набор задач (пошаговый план внедрения MVP)
+Шаг 0: Настроить репозиторий и шаблон проекта
+
+
+создать структуру wb_price_parser по секциям 7.1–7.2
+
+
+файл .env.example и README
+
+
+Шаг 1: Реализовать config.py
+
+
+загрузка .env, валидация обязательных параметров
+
+
+Шаг 2: Реализовать wb_api.py
+
+
+асинхронный клиент для WB JSON endpoint
+
+
+пагинация по page, сбор полей id, nmId, name, price.basic, price.product, product_url (если есть)
+
+
+конвертация цен: /100
+
+
+Шаг 3: Реализовать wb_xpath.py
+
+
+минимальная функция fetch_price_card_by_xpath(brand_url, article) с XPath .//span[contains(@class,"price-card")]
+
+
+парсинг доступных карточек и выбор текущей цены
+
+
+Шаг 4: Реализовать mapper.py
+
+
+функция map_json_to_dom(json_item) на основе discovery-данных
+
+
+возвращает dom_id или product_url для price-card
+
+
+Шаг 5: Реализовать exporter.py
+
+
+экспорт в .xlsx с указанными колонками
+
+
+учитывать timestamp и source поля
+
+
+Шаг 6: Реализовать main.py
+
+
+orchestrator: запускает fetcher, затем mapper, затем xpath fallback, затем exporter
+
+
+управление concurrency через asyncio.Semaphore(CONCURRENCY)
+
+
+Шаг 7: Discovery и тестирование
+
+
+собрать sample json_page_1.json и несколько html-страниц, сопоставить id ↔ nmId ↔ product_url ↔ dom_id
+
+
+проверить правильность prices в выборке 50 SKU
+
+
+Шаг 8: Документация
+
+
+README.md с инструкциями по запуску, примеры конфигураций, требования к окружению
+
+
+Шаг 9: Риски и мониторинг
+
+
+добавить базовый health-check и логирование ошибок
+
+
+предусмотреть файл logs/ при падениях
+
+
+Дополнительные предложения по улучшению (после MVP)
+Добавить API-ключи для кабинетов и поддержать креды через wb_api.py, если возникнет необходимость обращения к различным API-эндпоинтам кабинетов.
+
+
+Расширить конфигурацию для динамической смены dest, spp и бренда без перекомпиляции кода.
+
+
+Ввести прокси-пул и IP-роуцию на поздних стадиях проекта.
+
+
+Добавить мониторинг и алерты (например, уведомления в чат/почту при падении коннекта или превышении лимитов API).
+
+
+
