@@ -36,7 +36,9 @@ def run_parser():
     print("Запуск парсера брендов...")
     print("="*70 + "\n")
     
-    script_path = Path(__file__).parent / "parse_brands.py"
+    # Путь к parse_brands.py в корне проекта
+    project_root = Path(__file__).parent.parent
+    script_path = project_root / "parse_brands.py"
     
     if not script_path.exists():
         print(f"Ошибка: файл {script_path} не найден")
@@ -45,7 +47,7 @@ def run_parser():
     try:
         result = subprocess.run(
             [sys.executable, str(script_path)],
-            cwd=Path(__file__).parent,
+            cwd=project_root,
             check=False
         )
         return result.returncode

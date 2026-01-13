@@ -12,12 +12,12 @@
 
 **Windows (батч-файл):**
 ```bash
-fix_rebase_and_push.bat
+scripts/bat/fix_rebase_and_push.bat
 ```
 
 **Python скрипт:**
 ```bash
-python fix_rebase_and_push.py
+python scripts/fix_rebase_and_push.py
 ```
 
 ### Что делает скрипт:
@@ -65,32 +65,4 @@ git push origin main
 После выполнения команд проверьте на GitHub:
 1. Откройте репозиторий на GitHub
 2. Перейдите в ветку `main`
-3. Проверьте, что появились новые файлы:
-   - `src/api/wb_catalog_api.py`
-   - `parse_brands.py`
-   - `brands_config.json`
-   - и другие новые файлы
-
-## Если проблема осталась
-
-Если изменения всё ещё не видны на GitHub:
-
-1. Проверьте, что вы пушите в правильный remote:
-   ```bash
-   git remote -v
-   ```
-
-2. Проверьте текущую ветку:
-   ```bash
-   git branch
-   ```
-
-3. Проверьте последние коммиты:
-   ```bash
-   git log --oneline -5
-   ```
-
-4. Если нужно, принудительно обновите remote (осторожно!):
-   ```bash
-   git push origin main --force
-   ```
+3. Проверьте, что появились новые файлы

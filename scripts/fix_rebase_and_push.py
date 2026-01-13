@@ -6,9 +6,10 @@ from pathlib import Path
 def run_git_command(cmd: list, check=True):
     """Выполняет git команду."""
     try:
+        project_root = Path(__file__).parent.parent
         result = subprocess.run(
             ["git"] + cmd,
-            cwd=Path(__file__).parent,
+            cwd=project_root,
             capture_output=True,
             text=True,
             encoding="utf-8"
@@ -29,6 +30,8 @@ def run_git_command(cmd: list, check=True):
 
 def main():
     """Основная функция."""
+    project_root = Path(__file__).parent.parent
+    
     print("=" * 70)
     print("Исправление rebase и пуш в main")
     print("=" * 70)
@@ -45,6 +48,7 @@ def main():
     print("-" * 70)
     status_result = subprocess.run(
         ["git", "status"],
+        cwd=project_root,
         capture_output=True,
         text=True,
         encoding="utf-8"
@@ -97,7 +101,7 @@ def main():
 - Создан скрипт parse_brands.py для парсинга всех брендов
 - Добавлена утилита logger.py для настройки логирования
 - Обновлена конфигурация брендов в brands_config.json
-- Добавлены скрипты для запуска (run_parse_brands.bat, run_parse_brands.ps1)
+- Организована структура проекта (docs/, scripts/)
 """
     
     if not run_git_command(["commit", "-m", commit_message], check=False):

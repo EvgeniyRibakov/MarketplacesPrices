@@ -33,7 +33,7 @@ ENV/
 *.swo
 *~
 
-# Environment variables
+# Environment variables (секреты - остаются в корне)
 .env
 .env.local
 
@@ -50,7 +50,3 @@ Thumbs.db
 *.tmp
 *.bak
 *.swp
-
-
-
-
