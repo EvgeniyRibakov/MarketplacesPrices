@@ -1,0 +1,206 @@
+Source: https://habr.com/ru/companies/amvera/articles/948988/
+Шаг 0: Как устроен URL поиска Wildberries и что означают его параметры
+Когда мы работаем с данными Wildberries через внутреннее API, мы обращаемся к URL вроде этого:
+
+url = f"https://search.wb.ru/exactmatch/ru/common/v18/search?appType=1&amp;curr=rub&amp;dest=-1257786&amp;lang=ru&amp;page=1&amp;query={query}&amp;resultset=catalog&amp;sort=popular&amp;spp=30"
+
+На первый взгляд, это длинная и сложная строка, но на самом деле она состоит из обычных параметров, каждый из которых отвечает за конкретную часть поиска.
+
+Основные параметры
+appType — тип приложения: 1 = веб, 4 = мобильное. Влияет на формат данных.
+
+curr — валюта: rub — рубли, usd — доллары и т.д.
+
+dest — регион или склад. Определяет наличие товара и цену.
+
+lang — язык интерфейса и описаний товаров.
+
+page — номер страницы поиска. Позволяет листать результаты.
+
+query — поисковый запрос, например "смартфон" или "наушники".
+
+resultset — скорее всего тип поиска. Обычно catalog.
+
+sort — сортировка результатов: популярные, по цене, рейтингу и т.д.
+
+spp — количество товаров на одной странице.
+
+Шаг 1. Минимальный парсер Wildberries
+Для запуска нужен Python >=3.11 и библиотеки requests и pandas
+
+import requests
+import pandas as pd
+
+# Создаем строку (пока query = захардкоженое значение)
+query = "смартфон"
+url = f"https://search.wb.ru/exactmatch/ru/common/v18/search?appType=1&amp;curr=rub&amp;dest=-1257786&amp;lang=ru&amp;page=1&amp;query={query}&amp;resultset=catalog&amp;sort=popular&amp;spp=30"
+
+response = requests.get(url)
+data = response.json()
+
+# Получаем список продуктов
+products = data.get("products", [])
+
+# Преобразуем данные в удобный для создания DataFrame вид
+items = []
+for p in products:
+    item = {
+        "id": p.get("id"),
+        "name": p.get("name"),
+        "brand": p.get("brand"),
+        "price": p.get("sizes", [{}])[0].get("price", {}).get("product", 0) / 100,  # цена в рублях
+        "rating": p.get("rating", 0),
+        "feedbacks": p.get("feedbacks", 0)
+    }
+    items.append(item)
+
+df = pd.DataFrame(items)
+print(df.head())
+
+# Сохраняем в CSV
+df.to_csv("test.csv", index=False)
+
+
+Следующий момент для поиска идей:
+Пишу код для парсинга на wildberries. Когда загружаю в код ссылку на каталог(к примеру https://www.wildberries.ru/catalog/muzhchinam/odezhda/kostyumy), после запуска кода получаю значение цены на первый товар из каталога. Когда же я хочу получить цену на какой-либо из конкретных товаров (к примеру https://www.wildberries.ru/catalog/202925589/detail.aspx), то после запуска получаю сообщение, что цена не найдена. Что нужно исправить в коде, что бы я мог получить цену только одного конкретного товара по ссылке? Поиск элемента с ценой вроде правильный. Быть может нужно изменить подход?
+
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from fake_useragent import UserAgent
+import time
+import random
+import re
+def get_price_wildberries(url):
+    options = uc.ChromeOptions()
+    ua = UserAgent()
+    user_agent = ua.random
+    options.add_argument(f'user-agent={user_agent}')
+    driver = uc.Chrome(options=options)
+    try:
+        driver.get(url)
+        driver.implicitly_wait(10)  # Wait for dynamic content
+        # Поиск элемента с ценой. Подход должен быть гибким
+        price_element = driver.find_element(By.CSS_SELECTOR, ".price-block__final-price, .price__price, .price, span.price")
+        print(price_element.text)
+        price_text = price_element.text.strip()
+        print(price_text)
+
+        # Извлекаем только цифры и точки для преобразования в float
+        price_value = re.sub(r"[^\d\.]", "", price_text)
+
+        # Проверяем наличие точки
+        if "." not in price_value:
+           try:
+              return int(price_value)
+           except ValueError:
+                return None
+        try:
+             return float(price_value)
+        except ValueError:
+            return None
+
+Советую начать работать с инструментами разработчика (для Chrome или Mozilla это клавиша F12)
+
+Если открыть инструменты разработчика на wildberries и обновить страницу можно найти огромное количество ссылок на внутренние(хотя скорее открытые) api. Подсказка: сеть(network) -> список. там есть заголовки(headers). в заголовках есть url куда посылается запрос (и ip), какой запрос (POST, GET и т.п.) и что туда было отправлено (полезная нагрузка или payload).
+
+есть открытая ручка api wildberries: https://card.wb.ru/cards/v2/detail например, https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1255987&spp=30&ab_testing=false&nm=314337853
+
+wildberries, моё почтение - ручки работают молниеносно.
+
+для эффективного парса любой страницы, использующей dotnet(aspx) или js (или в случае wildberries - комбо) selenium и его аналоги стоит использовать только для выполнения действий на странице (ТОЛЬКО В ОБРАЗОВАТЕЛЬНЫХ ЦЕЛЯХ КОНЕЧНО... КОНЕЧНО...) либо в саааааааааааааамом крайнем случае. в остальном всегда есть api-ручки, по которым можно получить чистые данные в json или xml формате, без тонны html разметки, через requests или aiohttp.
+
+Как я парсил Wildberries без BeautifulSoup
+Простой
+Python
+*
+Программирование
+*
+Ожидает приглашения
+Всем привет! В этой статье я хочу рассказать как столкнулся с необходимостью парсить маркетплейс Wildberries. Задача была получать информацию о товаре (название, цена, скидка, бренд, рейтинг) по артикулу товара.
+
+Для новичков расскажу про парсинг - это процесс автоматического сбора и анализа данных с веб-сайтов.
+
+Например, если вам нужно собрать какой-то объем информации (как в моей задаче это название, цена, скидка, и т.д.) для большого количества объектов, то для автоматизации можно использовать парсеры(скрипты выполняющие парсинг).
+
+В Python чаще всего используют библиотеки BeautifulSoup, Selenium, lxml.
+
+Я покажу как можно парсить Wb без использования BeautifulSoup, только с помощью библиотеки requests.
+
+Указываем переменную с ссылкой на товара
+
+base_url = "https://card.wb.ru/cards/detail?&dest=-1257786&nm={}".format(article)
+
+где article - эта переменная функции, в которую мы будем передавать артикул товара
+
+Делаем header, который помогает "маскироваться" под браузер, чтобы сайт не заблокировал запрос
+
+headers = {
+ "User-Agent": "Mozilla/5.0 (Windows NT 10.0 Win64 x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+ "Access-Control-Allow-Credentials": "true",
+ "Access-Control-Allow-Headers":"Authorization,Accept,Origin,DNT,User-Agent,Content-Type,Wb-AppType,Wb-AppVersion,Xwbuid,Site-Locale,X-Clientinfo,Storage-Type,Data-Version,Model-Version,__wbl, x-captcha-id",
+ "Access-Control-Allow-Methods":"GET,OPTIONS",
+ "Access-control-Allow-Origin":"https://www.wildberries.ru",
+ "Content-Encoding":"gzip",
+ "Content-Type":"application/json charset=utf-8"
+ }
+он может быть и проще, я взял из реального браузера при входе на сайт wb
+
+Ну и отправляем запрос:
+
+response = requests.get(base_url, headers=headers)
+  if response.status_code == 200:
+      card_data = response.json()
+      url="https://www.wildberries.ru/catalog/{}/detail.aspx".format(article)
+      сontent = extract_and_save_data(card_data)
+  else:
+      content = url = None
+
+return {"content":content, "url":url}
+Функция extract_and_save_data
+Эта функция извлекает данные из ответа сервера в формате JSON и возвращает их в виде словаря
+
+def extract_and_save_data(data):
+  products = data.get("data", {}).get("products", [])
+  for product in products:
+    product_id = product.get("id", "unknown_id")
+    name = product.get("name", "No name")
+    brand = product.get("brand", "No brand")
+    price = int(product.get("priceU", 0) / 100)
+    sale_price = int(product.get("salePriceU", 0) / 100)
+    description = product.get("description", "No description")
+    rating = product.get("supplierRating","No rating")
+    sale = product.get("sale", 0)
+    totalQuantity = product.get("totalQuantity", "No data")
+    product_info = {
+            "ID": product_id,
+            "Name": name,
+            "Brand": brand,
+            "Price": price,
+            "SalePrice":sale_price,
+            "Description": description,
+            "Rating":str(rating),
+            "Sale": str(sale),
+            "Stock": totalQuantity
+        }
+  return product_info
+Здесь нужно знать только как работает метод .get, а он пытается получить значение по ключу. Если ключа нет, он возвращает значение по умолчанию.
+
+products = data.get("data", {}).get("products", [])
+
+data — это словарь (наш ответ сервера в формате JSON).
+Метод .get() пытается получить значение по ключу "data".
+Если ключ "data" существует, метод вернет его значение.
+Если ключа "data" нет, метод вернет второй аргумент '{}' - пустой словарь
+
+Пример:
+
+data = {"data": {"products": [1, 2, 3]}}
+result = data.get("data", {})  # Вернет {"products": [1, 2, 3]}
+.get("products", [])
+После того как мы получили значение по ключу "data" пытаемся получить значение по ключу "products" из словаря, который вернулся на предыдущем шаге
+
+Пример:
+
+data = {"data": {"products": [1, 2, 3]}}
+result = data.get("data", {}).get("products", [])  # Вернет [1, 2, 3]
+На этом и закончим

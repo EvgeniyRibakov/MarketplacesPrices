@@ -69,7 +69,7 @@ async def parse_all_brands():
     """Парсит все бренды из конфигурации."""
     logs_dir = project_root / "logs"
     logs_dir.mkdir(exist_ok=True)
-    setup_logger(logs_dir, debug=False)
+    setup_logger(logs_dir, debug=True)  # Включаем DEBUG для диагностики cookies
     
     logger.info("=" * 70)
     logger.info("Парсинг цен по брендам через внутренний API WB")
