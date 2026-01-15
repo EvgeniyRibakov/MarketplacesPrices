@@ -1,5 +1,6 @@
 """Модуль для работы с внутренним API каталога брендов Wildberries."""
 import asyncio
+import time
 from typing import List, Dict, Optional
 from urllib.parse import urlencode
 from curl_cffi.requests import AsyncSession
@@ -7,9 +8,9 @@ from loguru import logger
 
 
 class WBCatalogAPI:
-    """Клиент для работы с внутренним API каталога брендов WB."""
+    """Клиент для работы с внутренним API каталога продавцов WB."""
     
-    BASE_URL = "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog"
+    BASE_URL = "https://www.wildberries.ru/__internal/u-catalog/sellers/v4/catalog"
     
     # Маппинг supplierId -> название кабинета
     CABINET_MAPPING = {
@@ -246,13 +247,12 @@ class WBCatalogAPI:
         if self.session:
             await self.session.close()
     
-    def _build_url(self, brand_id: int, dest: int, spp: int = 30, 
-                   page: int = 1, fsupplier: Optional[str] = None) -> str:
-        """Строит URL для запроса каталога бренда."""
+    def _build_url(self, supplier_id: int, dest: int, spp: int = 30, 
+                   page: int = 1) -> str:
+        """Строит URL для запроса каталога продавца."""
         params = {
             "ab_testing": "false",
             "appType": "1",
-            "brand": str(brand_id),
             "curr": "rub",
             "dest": str(dest),
             "hide_dtype": "9",
@@ -261,23 +261,24 @@ class WBCatalogAPI:
             "page": str(page),
             "sort": "popular",
             "spp": str(spp),
+            "supplier": str(supplier_id),
         }
-        
-        if fsupplier:
-            params["fsupplier"] = fsupplier
         
         query_string = urlencode(params)
         return f"{self.BASE_URL}?{query_string}"
     
-    async def _fetch_page(self, brand_id: int, dest: int, spp: int, 
-                         page: int, fsupplier: Optional[str] = None, retry_count: int = 0) -> Optional[Dict]:
-        """Получает одну страницу каталога бренда."""
-        url = self._build_url(brand_id, dest, spp, page, fsupplier)
+    async def _fetch_page(self, supplier_id: int, dest: int, spp: int, 
+                         page: int, retry_count: int = 0) -> Optional[Dict]:
+        """Получает одну страницу каталога продавца."""
+        url = self._build_url(supplier_id, dest, spp, page)
         max_retries = 2
+        start_time = time.time()
         
         async with self.semaphore:
             try:
                 await asyncio.sleep(self.request_delay)
+                
+                logger.debug(f"📥 Запрос страницы {page} для продавца {supplier_id}...")
                 
                 # Используем кэшированные cookies
                 cookies_dict = self._cookies_dict.copy()
@@ -316,19 +317,49 @@ class WBCatalogAPI:
                     logger.debug(f"Найдены важные cookies: {', '.join(found_important)}")
                 
                 response = await self.session.get(url, headers=api_headers)
+                elapsed_time = time.time() - start_time
                 
                 if response.status_code == 200:
                     try:
                         data = response.json()
+                        products_count = len(data.get("products", []))
                         # Обновляем cookies из ответа
                         if response.cookies:
                             for name, value in response.cookies.items():
                                 self._cookies_dict[name] = value
                             self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
+                        
+                        logger.info(
+                            f"✅ Страница {page}: успешно загружена за {elapsed_time:.2f} сек. "
+                            f"Получено товаров: {products_count}"
+                        )
                         return data
                     except Exception as e:
-                        logger.error(f"Ошибка парсинга JSON ответа: {e}")
+                        logger.error(
+                            f"❌ Ошибка парсинга JSON ответа для страницы {page} "
+                            f"(время: {elapsed_time:.2f} сек): {e}"
+                        )
                         return None
+                elif response.status_code == 429:
+                    # Rate limiting - слишком много запросов
+                    # Используем exponential backoff для retry
+                    wait_time = min(2.0 * (2 ** retry_count), 30.0)  # Максимум 30 секунд
+                    
+                    if retry_count < max_retries:
+                        logger.warning(
+                            f"⚠️ Rate limit (429) при запросе страницы {page} "
+                            f"(время: {elapsed_time:.2f} сек). "
+                            f"Повтор через {wait_time:.1f} сек (попытка {retry_count + 1}/{max_retries})..."
+                        )
+                        await asyncio.sleep(wait_time)
+                        return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
+                    else:
+                        logger.error(
+                            f"❌ Rate limit (429) при запросе страницы {page} после {max_retries} попыток "
+                            f"(время: {elapsed_time:.2f} сек). Пропускаем страницу."
+                        )
+                        return None
+                        
                 elif response.status_code == 498:
                     # Детальная диагностика для статуса 498
                     try:
@@ -352,14 +383,14 @@ class WBCatalogAPI:
                             if retry_count < max_retries:
                                 logger.info(f"Повторная попытка запроса (попытка {retry_count + 1}/{max_retries})...")
                                 await asyncio.sleep(2.0)  # Задержка перед retry
-                                return await self._fetch_page(brand_id, dest, spp, page, fsupplier, retry_count + 1)
+                                return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
                     
                     # Проверяем, какие cookies были отправлены
                     sent_cookies = api_headers.get("Cookie", "НЕТ")
                     cookies_count = len(cookies_dict)
                     
                     logger.error(
-                        f"Ошибка 498 при запросе страницы {page} для бренда {brand_id}\n"
+                        f"Ошибка 498 при запросе страницы {page} для продавца {supplier_id}\n"
                         f"URL: {url}\n"
                         f"Отправлено cookies в заголовке: {'ДА' if sent_cookies != 'НЕТ' else 'НЕТ'} ({len(sent_cookies) if sent_cookies != 'НЕТ' else 0} символов)\n"
                         f"Cookies в кэше: {cookies_count} штук\n"
@@ -374,55 +405,76 @@ class WBCatalogAPI:
                         
                         if cookies_updated:
                             await asyncio.sleep(2.0)
-                            return await self._fetch_page(brand_id, dest, spp, page, fsupplier, retry_count + 1)
+                            return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
                         else:
                             # Если не получилось обновить, пробуем переинициализировать сессию
                             logger.warning("Попытка переинициализации сессии...")
                             await self._initialize_session()
                             await asyncio.sleep(2.0)
-                            return await self._fetch_page(brand_id, dest, spp, page, fsupplier, retry_count + 1)
+                            return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
                     elif retry_count == 0 and self.custom_cookies:
                         # Если автоматическое получение отключено, пробуем переинициализировать
                         logger.warning("Попытка переинициализации сессии с обновленными cookies...")
                         await self._initialize_session()
                         await asyncio.sleep(2.0)
-                        return await self._fetch_page(brand_id, dest, spp, page, fsupplier, retry_count + 1)
+                        return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
                     
                     return None
                 else:
                     logger.warning(
-                        f"Ошибка запроса страницы {page}: статус {response.status_code}\n"
+                        f"⚠️ Ошибка запроса страницы {page}: статус {response.status_code} "
+                        f"(время: {elapsed_time:.2f} сек)\n"
                         f"URL: {url}"
                     )
                     return None
                         
             except asyncio.TimeoutError:
-                logger.error(f"Таймаут при запросе страницы {page}")
+                elapsed_time = time.time() - start_time
+                logger.error(
+                    f"❌ Таймаут при запросе страницы {page} "
+                    f"(время ожидания: {elapsed_time:.2f} сек)"
+                )
                 return None
             except Exception as e:
-                logger.error(f"Ошибка при запросе страницы {page}: {e}")
+                elapsed_time = time.time() - start_time
+                logger.error(
+                    f"❌ Исключение при запросе страницы {page} "
+                    f"(время: {elapsed_time:.2f} сек): {e}"
+                )
                 logger.exception("Детали исключения:")
                 return None
     
-    async def fetch_brand_catalog(self, brand_id: int, dest: int, spp: int = 30,
-                                 fsupplier: Optional[str] = None) -> List[Dict]:
-        """Получает весь каталог бренда (все страницы)."""
-        logger.info(f"Начинаем загрузку каталога бренда {brand_id}...")
+    async def fetch_seller_catalog(self, supplier_id: int, dest: int, spp: int = 30) -> List[Dict]:
+        """Получает весь каталог продавца (все страницы)."""
+        catalog_start_time = time.time()
+        cabinet_name = self.CABINET_MAPPING.get(supplier_id, f"UNKNOWN_{supplier_id}")
+        logger.info(f"🚀 Начинаем загрузку каталога продавца {supplier_id} ({cabinet_name})...")
         
         all_products = []
         page = 1
+        successful_pages = 0
+        failed_pages = 0
         
-        first_page = await self._fetch_page(brand_id, dest, spp, page, fsupplier)
+        first_page_start = time.time()
+        first_page = await self._fetch_page(supplier_id, dest, spp, page)
+        first_page_time = time.time() - first_page_start
         
         if not first_page:
-            logger.error(f"Не удалось получить первую страницу для бренда {brand_id}")
+            logger.error(
+                f"❌ Не удалось получить первую страницу для продавца {supplier_id} "
+                f"(время: {first_page_time:.2f} сек)"
+            )
             return []
         
         products = first_page.get("products", [])
         total = first_page.get("total", 0)
         all_products.extend(products)
+        successful_pages += 1
         
-        logger.info(f"Страница 1: получено {len(products)} товаров, всего: {total}")
+        logger.info(
+            f"✅ Страница 1: получено {len(products)} товаров из {total} всего "
+            f"(время: {first_page_time:.2f} сек)"
+        )
         
         products_per_page = len(products)
         if products_per_page > 0:
@@ -430,48 +482,114 @@ class WBCatalogAPI:
         else:
             total_pages = 1
         
-        if total_pages > 1:
-            tasks = []
-            for page_num in range(2, total_pages + 1):
-                task = self._fetch_page(brand_id, dest, spp, page_num, fsupplier)
-                tasks.append(task)
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for page_num, result in enumerate(results, start=2):
-                if isinstance(result, Exception):
-                    logger.error(f"Ошибка при загрузке страницы {page_num}: {result}")
-                    continue
-                
-                if result:
-                    page_products = result.get("products", [])
-                    all_products.extend(page_products)
-                    logger.info(f"Страница {page_num}: получено {len(page_products)} товаров")
+        logger.info(f"📄 Всего страниц для загрузки: {total_pages}")
         
-        logger.success(f"Бренд {brand_id}: всего получено {len(all_products)} товаров")
+        if total_pages > 1:
+            # Загружаем страницы батчами, чтобы избежать rate limiting
+            batch_size = 2  # Уменьшили до 2 для снижения 429 ошибок
+            total_batches = ((total_pages - 1) + batch_size - 1) // batch_size
+            
+            logger.info(
+                f"📦 Загрузка страниц батчами: размер батча {batch_size}, "
+                f"всего батчей {total_batches}"
+            )
+            
+            for batch_num, batch_start in enumerate(range(2, total_pages + 1, batch_size), 1):
+                batch_start_time = time.time()
+                batch_end = min(batch_start + batch_size, total_pages + 1)
+                batch_pages = list(range(batch_start, batch_end))
+                
+                logger.info(
+                    f"📦 Батч {batch_num}/{total_batches}: загрузка страниц {batch_start}-{batch_end-1}..."
+                )
+                
+                tasks = []
+                for page_num in batch_pages:
+                    task = self._fetch_page(supplier_id, dest, spp, page_num)
+                    tasks.append((page_num, task))
+                
+                # Выполняем батч параллельно
+                batch_results = await asyncio.gather(
+                    *[task for _, task in tasks],
+                    return_exceptions=True
+                )
+                
+                batch_time = time.time() - batch_start_time
+                batch_successful = 0
+                batch_failed = 0
+                
+                # Обрабатываем результаты батча
+                for (page_num, _), result in zip(tasks, batch_results):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            f"❌ Ошибка при загрузке страницы {page_num}: {result}"
+                        )
+                        failed_pages += 1
+                        batch_failed += 1
+                        continue
+                    
+                    if result:
+                        page_products = result.get("products", [])
+                        all_products.extend(page_products)
+                        successful_pages += 1
+                        batch_successful += 1
+                    else:
+                        failed_pages += 1
+                        batch_failed += 1
+                
+                logger.info(
+                    f"✅ Батч {batch_num}/{total_batches} завершен за {batch_time:.2f} сек: "
+                    f"успешно {batch_successful}, ошибок {batch_failed}"
+                )
+                
+                # Увеличили задержку между батчами для снижения нагрузки
+                if batch_end <= total_pages:
+                    await asyncio.sleep(1.0)
+        
+        catalog_time = time.time() - catalog_start_time
+        
+        logger.success(
+            f"✅ Каталог продавца {supplier_id} ({cabinet_name}) загружен: "
+            f"всего товаров {len(all_products)}, "
+            f"страниц успешно {successful_pages}, "
+            f"страниц с ошибками {failed_pages}, "
+            f"время загрузки {catalog_time:.2f} сек"
+        )
+        
         return all_products
     
     @staticmethod
-    def parse_product(product: Dict, brand_id: int, brand_name: str) -> List[Dict]:
-        """Парсит товар из JSON ответа API."""
+    def parse_product(product: Dict, supplier_id: int) -> List[Dict]:
+        """Парсит товар из JSON ответа API продавца."""
         results = []
         
         product_id = product.get("id")
         product_name = product.get("name", "")
-        supplier_id = product.get("supplierId")
+        product_supplier_id = product.get("supplierId")
         supplier_name = product.get("supplier", "")
         
-        # Фильтруем товары: обрабатываем только товары из разрешенных кабинетов
-        if supplier_id is None:
+        # Проверяем, что supplier_id товара совпадает с запрашиваемым
+        # (при парсинге страницы продавца все товары должны быть от этого продавца)
+        if product_supplier_id is None:
             # Если supplier_id отсутствует - это баг, пропускаем товар
+            logger.warning(f"⚠️ Товар {product_id} не имеет supplier_id, пропускаем")
             return []
         
-        if supplier_id not in WBCatalogAPI.CABINET_MAPPING:
-            # Пропускаем товары от перекупов (не из разрешенных кабинетов)
+        if product_supplier_id != supplier_id:
+            # Товар от другого продавца - это не должно происходить при парсинге страницы продавца
+            logger.warning(
+                f"⚠️ Несоответствие supplier_id: ожидали {supplier_id}, получили {product_supplier_id} "
+                f"для товара {product_id}, пропускаем"
+            )
             return []
         
-        cabinet_name = WBCatalogAPI.CABINET_MAPPING[supplier_id]
+        # Получаем название кабинета
+        cabinet_name = WBCatalogAPI.CABINET_MAPPING.get(supplier_id, f"UNKNOWN_{supplier_id}")
         cabinet_id = supplier_id
+        
+        # Извлекаем brand_id и brand_name из товара, если есть
+        brand_id = product.get("brandId") or product.get("brand") or None
+        brand_name = product.get("brandName") or product.get("brand") or ""
         
         sizes = product.get("sizes", [])
         
@@ -491,8 +609,8 @@ class WBCatalogAPI:
                 "price_basic": price_data.get("basic", 0) / 100 if price_data.get("basic") else None,
                 "price_product": price_data.get("product", 0) / 100 if price_data.get("product") else None,
                 "price_card": None,
-                "source_price_basic": "api-catalog",
-                "source_price_product": "api-catalog",
+                "source_price_basic": "api-seller-catalog",
+                "source_price_product": "api-seller-catalog",
                 "source_price_card": None,
             })
         else:
@@ -515,8 +633,8 @@ class WBCatalogAPI:
                     "price_basic": price_data.get("basic", 0) / 100 if price_data.get("basic") else None,
                     "price_product": price_data.get("product", 0) / 100 if price_data.get("product") else None,
                     "price_card": None,
-                    "source_price_basic": "api-catalog",
-                    "source_price_product": "api-catalog",
+                    "source_price_basic": "api-seller-catalog",
+                    "source_price_product": "api-seller-catalog",
                     "source_price_card": None,
                 })
         

@@ -1,4 +1,4 @@
-"""Скрипт для парсинга цен по брендам через внутренний API WB."""
+"""Скрипт для парсинга цен по продавцам через внутренний API WB."""
 import asyncio
 import json
 import sys
@@ -65,24 +65,35 @@ def load_env_config() -> Dict:
         return {"dest": -3115289, "spp": 30, "cookies": None}
 
 
-async def parse_all_brands():
-    """Парсит все бренды из конфигурации."""
+async def parse_all_sellers():
+    """Парсит всех продавцов из конфигурации кабинетов."""
+    import time
+    from src.api.wb_catalog_api import WBCatalogAPI
+    
     logs_dir = project_root / "logs"
     logs_dir.mkdir(exist_ok=True)
     setup_logger(logs_dir, debug=True)  # Включаем DEBUG для диагностики cookies
     
+    total_start_time = time.time()
+    
     logger.info("=" * 70)
-    logger.info("Парсинг цен по брендам через внутренний API WB")
+    logger.info("🚀 Парсинг цен по продавцам через внутренний API WB")
     logger.info("=" * 70)
     
-    brands_config = load_brands_config()
+    config_start = time.time()
     env_config = load_env_config()
+    config_time = time.time() - config_start
     
-    if not brands_config:
-        logger.error("Не удалось загрузить конфигурацию брендов")
-        return []
+    # Парсим только COSMO и BEAUTYLAB
+    suppliers = [
+        224650,   # COSMO
+        4428365   # BEAUTYLAB
+    ]
     
-    logger.info(f"Найдено брендов для обработки: {len(brands_config)}")
+    logger.info(
+        f"✅ Конфигурация загружена за {config_time:.2f} сек: "
+        f"найдено продавцов для обработки: {len(suppliers)}"
+    )
     
     parser = WildberriesParser(
         api_key="",
@@ -97,42 +108,86 @@ async def parse_all_brands():
     cookies = env_config.get("cookies")
     
     if cookies:
-        logger.info("Используются cookies из .env файла")
+        logger.info("✅ Используются cookies из .env файла")
     else:
-        logger.warning("Cookies не найдены в .env - запросы могут быть заблокированы антиботом")
+        logger.warning("⚠️ Cookies не найдены в .env - запросы могут быть заблокированы антиботом")
     
-    for brand_name, brand_data in brands_config.items():
-        brand_id = int(brand_data["brand_id"])
+    successful_suppliers = 0
+    failed_suppliers = 0
+    supplier_times = []
+    
+    for supplier_index, supplier_id in enumerate(suppliers, 1):
+        cabinet_name = WBCatalogAPI.CABINET_MAPPING[supplier_id]
+        supplier_start_time = time.time()
+        
         logger.info(f"\n{'='*70}")
-        logger.info(f"Обработка бренда: {brand_name} (ID: {brand_id})")
+        logger.info(
+            f"📦 Продавец {supplier_index}/{len(suppliers)}: {supplier_id} ({cabinet_name})"
+        )
         logger.info(f"{'='*70}")
         
         try:
-            results = await parser.parse_brand_catalog(
-                brand_id=brand_id,
-                brand_name=brand_name.upper(),
+            results = await parser.parse_seller_catalog(
+                supplier_id=supplier_id,
                 dest=dest,
                 spp=spp,
-                fsupplier=brand_data.get("fsupplier"),
                 cookies=cookies
             )
             
+            supplier_time = time.time() - supplier_start_time
+            supplier_times.append((cabinet_name, supplier_time))
+            
             all_results.extend(results)
-            logger.success(f"✓ Бренд {brand_name}: получено {len(results)} записей")
+            successful_suppliers += 1
+            
+            logger.success(
+                f"✅ Продавец {supplier_id} ({cabinet_name}): получено {len(results)} записей за {supplier_time:.2f} сек"
+            )
             
         except Exception as e:
-            logger.error(f"✗ Ошибка при обработке бренда {brand_name}: {e}")
+            supplier_time = time.time() - supplier_start_time
+            failed_suppliers += 1
+            
+            logger.error(
+                f"❌ Ошибка при обработке продавца {supplier_id} ({cabinet_name}) "
+                f"(время до ошибки: {supplier_time:.2f} сек): {e}"
+            )
             logger.exception("Детали ошибки:")
             continue
+    
+    total_time = time.time() - total_start_time
+    
+    logger.info("\n" + "=" * 70)
+    logger.info("📊 ИТОГОВАЯ СТАТИСТИКА ПАРСИНГА")
+    logger.info("=" * 70)
+    logger.info(f"⏱️  Общее время выполнения: {total_time:.2f} сек ({total_time/60:.2f} мин)")
+    logger.info(f"✅ Успешно обработано продавцов: {successful_suppliers}")
+    logger.info(f"❌ Ошибок при обработке: {failed_suppliers}")
+    logger.info(f"📦 Всего получено записей: {len(all_results)}")
+    
+    if supplier_times:
+        logger.info("\n⏱️  Время обработки по продавцам:")
+        for cabinet_name, supplier_time in supplier_times:
+            logger.info(f"  • {cabinet_name}: {supplier_time:.2f} сек")
+        
+        avg_time = sum(st[1] for st in supplier_times) / len(supplier_times)
+        logger.info(f"  📊 Среднее время на продавца: {avg_time:.2f} сек")
+    
+    logger.info("=" * 70)
     
     return all_results
 
 
 def export_results(results: List[Dict], output_dir: Path):
     """Экспортирует результаты в Excel."""
+    import time
+    
     if not results:
-        logger.warning("Нет данных для экспорта")
+        logger.warning("⚠️ Нет данных для экспорта")
         return
+    
+    export_start_time = time.time()
+    logger.info("💾 Начинаем экспорт результатов в Excel...")
     
     try:
         import pandas as pd
@@ -169,55 +224,96 @@ def export_results(results: List[Dict], output_dir: Path):
                 col_letter = get_column_letter(idx)
                 worksheet.column_dimensions[col_letter].width = min(max_length + 2, 50)
         
-        logger.success(f"✅ Результаты сохранены в: {output_file}")
+        export_time = time.time() - export_start_time
+        
+        logger.success(
+            f"✅ Результаты сохранены в: {output_file} (время экспорта: {export_time:.2f} сек)"
+        )
         logger.info(f"📊 Всего строк: {len(df)}")
         logger.info(f"📋 Колонки: {', '.join(df.columns.tolist())}")
         
         if 'price_basic' in df.columns:
             filled = df['price_basic'].notna().sum()
-            logger.info(f"💰 Заполнено базовых цен: {filled} из {len(df)} ({filled/len(df)*100:.1f}%)")
+            logger.info(
+                f"💰 Заполнено базовых цен: {filled} из {len(df)} "
+                f"({filled/len(df)*100:.1f}%)"
+            )
         
         if 'price_product' in df.columns:
             filled = df['price_product'].notna().sum()
-            logger.info(f"💰 Заполнено цен продукта: {filled} из {len(df)} ({filled/len(df)*100:.1f}%)")
+            logger.info(
+                f"💰 Заполнено цен продукта: {filled} из {len(df)} "
+                f"({filled/len(df)*100:.1f}%)"
+            )
         
         if 'brand_name' in df.columns:
             logger.info("\n📈 Статистика по брендам:")
             brand_stats = df.groupby('brand_name').size()
             for brand, count in brand_stats.items():
-                logger.info(f"  {brand}: {count} записей")
+                logger.info(f"  • {brand}: {count} записей")
         
         if 'cabinet_name' in df.columns:
             logger.info("\n🏢 Статистика по кабинетам:")
             cabinet_stats = df.groupby('cabinet_name').size()
             for cabinet, count in cabinet_stats.items():
-                logger.info(f"  {cabinet}: {count} записей")
+                logger.info(f"  • {cabinet}: {count} записей")
         
     except Exception as e:
-        logger.error(f"Ошибка при экспорте результатов: {e}")
+        export_time = time.time() - export_start_time
+        logger.error(
+            f"❌ Ошибка при экспорте результатов (время до ошибки: {export_time:.2f} сек): {e}"
+        )
         logger.exception("Детали ошибки:")
 
 
 async def main():
     """Основная функция."""
+    import time
+    
+    main_start_time = time.time()
+    
     try:
-        results = await parse_all_brands()
+        results = await parse_all_sellers()
+        
+        parse_time = time.time() - main_start_time
         
         logger.info("\n" + "=" * 70)
-        logger.success(f"Обработка завершена. Всего записей: {len(results)}")
+        logger.success(
+            f"✅ Обработка завершена. Всего записей: {len(results)} "
+            f"(время парсинга: {parse_time:.2f} сек)"
+        )
         logger.info("=" * 70)
         
+        export_start = time.time()
         output_dir = project_root / "output"
         export_results(results, output_dir)
+        export_time = time.time() - export_start
+        
+        total_time = time.time() - main_start_time
+        
+        logger.info("\n" + "=" * 70)
+        logger.info("🎉 ПРОЦЕСС ЗАВЕРШЕН УСПЕШНО")
+        logger.info("=" * 70)
+        logger.info(f"⏱️  Общее время выполнения: {total_time:.2f} сек ({total_time/60:.2f} мин)")
+        logger.info(f"  • Парсинг: {parse_time:.2f} сек")
+        logger.info(f"  • Экспорт: {export_time:.2f} сек")
+        logger.info(f"📦 Всего записей: {len(results)}")
+        logger.info("=" * 70)
         
         return 0
         
     except KeyboardInterrupt:
-        logger.warning("Прервано пользователем")
+        elapsed_time = time.time() - main_start_time
+        logger.warning(
+            f"⚠️ Прервано пользователем (время работы: {elapsed_time:.2f} сек)"
+        )
         return 1
         
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        elapsed_time = time.time() - main_start_time
+        logger.error(
+            f"❌ Критическая ошибка (время до ошибки: {elapsed_time:.2f} сек): {e}"
+        )
         logger.exception("Детали ошибки:")
         return 1
 

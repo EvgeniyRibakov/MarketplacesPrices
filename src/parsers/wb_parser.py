@@ -151,21 +151,105 @@ class WildberriesParser:
         Returns:
             Список товаров с ценами из каталога бренда
         """
-        logger.info(f"Начинаем парсинг каталога бренда {brand_name} (ID: {brand_id})...")
+        import time
+        parse_start_time = time.time()
+        logger.info(f"🚀 Начинаем парсинг каталога бренда {brand_name} (ID: {brand_id})...")
         
         all_results = []
+        total_products = 0
+        filtered_products = 0
         
         async with WBCatalogAPI(request_delay=0.1, max_concurrent=5, cookies=cookies) as api:
+            fetch_start = time.time()
             products = await api.fetch_brand_catalog(
                 brand_id=brand_id,
                 dest=dest,
                 spp=spp,
                 fsupplier=fsupplier
             )
+            fetch_time = time.time() - fetch_start
             
+            total_products = len(products)
+            logger.info(
+                f"📦 Получено {total_products} товаров из API за {fetch_time:.2f} сек. "
+                f"Начинаем парсинг и фильтрацию..."
+            )
+            
+            parse_products_start = time.time()
             for product in products:
                 parsed_items = WBCatalogAPI.parse_product(product, brand_id, brand_name)
-                all_results.extend(parsed_items)
+                if parsed_items:
+                    all_results.extend(parsed_items)
+                else:
+                    filtered_products += 1
+            
+            parse_products_time = time.time() - parse_products_start
         
-        logger.success(f"Бренд {brand_name}: обработано {len(all_results)} записей")
+        total_time = time.time() - parse_start_time
+        
+        logger.success(
+            f"✅ Бренд {brand_name}: обработано {len(all_results)} записей "
+            f"(отфильтровано {filtered_products} товаров от перекупов, "
+            f"всего товаров из API: {total_products}). "
+            f"Время парсинга: {parse_products_time:.2f} сек, "
+            f"общее время: {total_time:.2f} сек"
+        )
+        
+        return all_results
+    
+    async def parse_seller_catalog(self, supplier_id: int, dest: int, spp: int = 30,
+                                   cookies: Optional[str] = None) -> List[Dict]:
+        """Парсинг каталога продавца через внутренний API.
+        
+        Args:
+            supplier_id: ID продавца (supplier_id)
+            dest: ID региона/ПВЗ
+            spp: Параметр spp (обычно 30)
+            cookies: Cookies из браузера в формате "name1=value1; name2=value2"
+        
+        Returns:
+            Список товаров с ценами из каталога продавца
+        """
+        import time
+        from src.api.wb_catalog_api import WBCatalogAPI
+        
+        parse_start_time = time.time()
+        cabinet_name = WBCatalogAPI.CABINET_MAPPING.get(supplier_id, f"UNKNOWN_{supplier_id}")
+        logger.info(f"🚀 Начинаем парсинг каталога продавца {supplier_id} ({cabinet_name})...")
+        
+        all_results = []
+        total_products = 0
+        
+        async with WBCatalogAPI(request_delay=0.1, max_concurrent=5, cookies=cookies) as api:
+            fetch_start = time.time()
+            products = await api.fetch_seller_catalog(
+                supplier_id=supplier_id,
+                dest=dest,
+                spp=spp
+            )
+            fetch_time = time.time() - fetch_start
+            
+            total_products = len(products)
+            logger.info(
+                f"📦 Получено {total_products} товаров из API за {fetch_time:.2f} сек. "
+                f"Начинаем парсинг..."
+            )
+            
+            parse_products_start = time.time()
+            for product in products:
+                parsed_items = WBCatalogAPI.parse_product(product, supplier_id)
+                if parsed_items:
+                    all_results.extend(parsed_items)
+            
+            parse_products_time = time.time() - parse_products_start
+        
+        total_time = time.time() - parse_start_time
+        
+        logger.success(
+            f"✅ Продавец {supplier_id} ({cabinet_name}): обработано {len(all_results)} записей "
+            f"(всего товаров из API: {total_products}). "
+            f"Время парсинга: {parse_products_time:.2f} сек, "
+            f"общее время: {total_time:.2f} сек"
+        )
+        
         return all_results
