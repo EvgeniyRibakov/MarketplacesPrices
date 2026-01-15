@@ -708,11 +708,15 @@ class WBCatalogAPI:
                         
                         list_goods = data.get("data", {}).get("listGoods", [])
                         
+                        # Отслеживаем, какие товары получили данные
+                        found_nm_ids = set()
+                        
                         for good in list_goods:
                             nm_id = good.get("nmID")
                             if not nm_id:
                                 continue
                             
+                            found_nm_ids.add(nm_id)
                             sizes = good.get("sizes", [])
                             
                             if not sizes:
@@ -720,6 +724,11 @@ class WBCatalogAPI:
                                 discounted_price = good.get("discountedPrice")
                                 if discounted_price is not None:
                                     all_results[nm_id] = {None: discounted_price}
+                                else:
+                                    # Товар есть в ответе, но нет discountedPrice
+                                    logger.debug(
+                                        f"⚠️ Товар {nm_id} есть в ответе API, но нет discountedPrice"
+                                    )
                             else:
                                 # Товар с размерами - для каждого размера свой discountedPrice
                                 # Сохраняем как по sizeID, так и по techSizeName для гибкого сопоставления
@@ -741,10 +750,23 @@ class WBCatalogAPI:
                                         "_by_id": size_prices,
                                         "_by_name": size_prices_by_name
                                     }
+                                else:
+                                    # Товар есть в ответе, но нет discountedPrice для размеров
+                                    logger.debug(
+                                        f"⚠️ Товар {nm_id} есть в ответе API, но нет discountedPrice для размеров"
+                                    )
+                        
+                        # Логируем товары, которые не были найдены в ответе
+                        missing_nm_ids = set(batch) - found_nm_ids
+                        if missing_nm_ids:
+                            logger.warning(
+                                f"⚠️ Батч {batch_num}: {len(missing_nm_ids)} товаров не найдено в ответе API "
+                                f"(примеры: {list(missing_nm_ids)[:5]})"
+                            )
                         
                         logger.success(
                             f"✅ Батч {batch_num}: получено данных для {len(list_goods)} товаров "
-                            f"за {elapsed_time:.2f} сек"
+                            f"из {len(batch)} запрошенных за {elapsed_time:.2f} сек"
                         )
                     
                     elif response.status_code == 429:
@@ -773,11 +795,16 @@ class WBCatalogAPI:
                             if response.status_code == 200:
                                 data = response.json()
                                 list_goods = data.get("data", {}).get("listGoods", [])
+                                found_nm_ids_retry = set()
+                                
                                 for good in list_goods:
                                     nm_id = good.get("nmID")
                                     if not nm_id:
                                         continue
+                                    
+                                    found_nm_ids_retry.add(nm_id)
                                     sizes = good.get("sizes", [])
+                                    
                                     if not sizes:
                                         discounted_price = good.get("discountedPrice")
                                         if discounted_price is not None:
@@ -799,6 +826,12 @@ class WBCatalogAPI:
                                                 "_by_id": size_prices,
                                                 "_by_name": size_prices_by_name
                                             }
+                                
+                                missing_nm_ids_retry = set(batch) - found_nm_ids_retry
+                                if missing_nm_ids_retry:
+                                    logger.warning(
+                                        f"⚠️ Батч {batch_num} (retry): {len(missing_nm_ids_retry)} товаров не найдено в ответе API"
+                                    )
                     
                     else:
                         elapsed_time = time.time() - start_time

@@ -58,18 +58,34 @@ def load_env_config() -> Dict:
         
         discounts_api_token = os.getenv("WB_DISCOUNTS_API_TOKEN")
         
+        # Загружаем токены для каждого кабинета (если указаны)
+        discounts_tokens_by_cabinet = {}
+        cabinet_names = ["COSMO", "BEAUTYLAB", "MAU", "MAB", "MMA", "DREAMLAB"]
+        for cabinet_name in cabinet_names:
+            token = os.getenv(f"WB_DISCOUNTS_API_TOKEN_{cabinet_name}")
+            if token:
+                discounts_tokens_by_cabinet[cabinet_name] = token
+        
         return {
             "dest": int(os.getenv("WB_DEST", "-3115289")),
             "spp": int(os.getenv("WB_SPP", "30")),
             "cookies": cookies_string,
             "discounts_api_token": discounts_api_token,
+            "discounts_tokens_by_cabinet": discounts_tokens_by_cabinet,
         }
     except Exception:
-        return {"dest": -3115289, "spp": 30, "cookies": None, "discounts_api_token": None}
+        return {
+            "dest": -3115289, 
+            "spp": 30, 
+            "cookies": None, 
+            "discounts_api_token": None,
+            "discounts_tokens_by_cabinet": {}
+        }
 
 
 async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Optional[str] = None, 
-                                             discounts_api_token: Optional[str] = None) -> List[Dict]:
+                                             discounts_api_token: Optional[str] = None,
+                                             discounts_tokens_by_cabinet: Optional[Dict[str, str]] = None) -> List[Dict]:
     """Получает discountedPrice для всех товаров из результатов парсинга.
     
     Args:
@@ -92,38 +108,95 @@ async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Opti
     
     fetch_start_time = time.time()
     
-    # Собираем уникальные product_id
+    # Собираем уникальные product_id и группируем по кабинетам для анализа
     product_ids = set()
+    product_ids_by_cabinet = {}
+    
     for result in results:
         product_id = result.get("product_id")
+        cabinet_name = result.get("cabinet_name", "Unknown")
+        
         if product_id:
             product_ids.add(product_id)
+            if cabinet_name not in product_ids_by_cabinet:
+                product_ids_by_cabinet[cabinet_name] = []
+            product_ids_by_cabinet[cabinet_name].append(product_id)
     
     logger.info(f"📊 Найдено уникальных товаров: {len(product_ids)}")
+    
+    # Логируем распределение по кабинетам
+    for cabinet_name, ids in product_ids_by_cabinet.items():
+        logger.info(f"  • {cabinet_name}: {len(ids)} товаров")
     
     if not product_ids:
         logger.warning("⚠️ Не найдено product_id в результатах")
         return results
     
-    # Получаем discountedPrice через API
-    if not discounts_api_token:
+    # Проверяем наличие токенов
+    if not discounts_api_token and not (discounts_tokens_by_cabinet and discounts_tokens_by_cabinet):
         logger.warning(
             "⚠️ WB_DISCOUNTS_API_TOKEN не найден в .env файле. "
             "Запросы к discounts API будут пропущены. "
-            "Добавьте токен в .env: WB_DISCOUNTS_API_TOKEN=your_token"
+            "Добавьте токен в .env: WB_DISCOUNTS_API_TOKEN=your_token "
+            "или WB_DISCOUNTS_API_TOKEN_COSMO, WB_DISCOUNTS_API_TOKEN_BEAUTYLAB и т.д."
         )
         # Возвращаем результаты без price_before_spp
         for result in results:
             result["price_before_spp"] = None
         return results
     
-    async with WBCatalogAPI(
-        request_delay=0.1, 
-        max_concurrent=10, 
-        cookies=cookies,
-        discounts_api_token=discounts_api_token
-    ) as api:
-        discounted_prices = await api.fetch_discounted_prices(list(product_ids))
+    # Если есть токены по кабинетам, делаем отдельные запросы для каждого кабинета
+    if discounts_tokens_by_cabinet:
+        logger.info("🔑 Используются токены по кабинетам для запросов к discounts API")
+        all_discounted_prices = {}
+        
+        # Группируем товары по кабинетам
+        products_by_cabinet = {}
+        for result in results:
+            cabinet_name = result.get("cabinet_name", "Unknown")
+            product_id = result.get("product_id")
+            if product_id:
+                if cabinet_name not in products_by_cabinet:
+                    products_by_cabinet[cabinet_name] = []
+                products_by_cabinet[cabinet_name].append(product_id)
+        
+        # Делаем запросы для каждого кабинета с соответствующим токеном
+        for cabinet_name, product_ids_list in products_by_cabinet.items():
+            cabinet_token = discounts_tokens_by_cabinet.get(cabinet_name)
+            
+            if not cabinet_token:
+                # Fallback на общий токен, если нет токена для кабинета
+                cabinet_token = discounts_api_token
+                if not cabinet_token:
+                    logger.warning(
+                        f"⚠️ Нет токена для кабинета {cabinet_name}, пропускаем {len(product_ids_list)} товаров"
+                    )
+                    continue
+            
+            logger.info(
+                f"📊 Запрос discountedPrice для кабинета {cabinet_name}: "
+                f"{len(set(product_ids_list))} уникальных товаров"
+            )
+            
+            async with WBCatalogAPI(
+                request_delay=0.1, 
+                max_concurrent=10, 
+                cookies=cookies,
+                discounts_api_token=cabinet_token
+            ) as api:
+                cabinet_discounted_prices = await api.fetch_discounted_prices(list(set(product_ids_list)))
+                all_discounted_prices.update(cabinet_discounted_prices)
+        
+        discounted_prices = all_discounted_prices
+    else:
+        # Используем общий токен для всех товаров
+        async with WBCatalogAPI(
+            request_delay=0.1, 
+            max_concurrent=10, 
+            cookies=cookies,
+            discounts_api_token=discounts_api_token
+        ) as api:
+            discounted_prices = await api.fetch_discounted_prices(list(product_ids))
     
     fetch_time = time.time() - fetch_start_time
     
@@ -132,12 +205,36 @@ async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Opti
         f"за {fetch_time:.2f} сек"
     )
     
+    # Анализируем, какие кабинеты получили данные
+    found_by_cabinet = {}
+    for result in results:
+        product_id = result.get("product_id")
+        cabinet_name = result.get("cabinet_name", "Unknown")
+        if product_id in discounted_prices:
+            if cabinet_name not in found_by_cabinet:
+                found_by_cabinet[cabinet_name] = 0
+            found_by_cabinet[cabinet_name] += 1
+    
+    if found_by_cabinet:
+        logger.info("📊 Получено данных по кабинетам:")
+        for cabinet_name, count in found_by_cabinet.items():
+            total = len(product_ids_by_cabinet.get(cabinet_name, []))
+            logger.info(f"  • {cabinet_name}: {count} из {total} товаров ({count/total*100:.1f}%)")
+    
     # Сопоставляем discountedPrice с товарами
     updated_count = 0
+    not_found_in_api = []
+    not_matched_by_size = []
+    
+    # Группируем по кабинетам для анализа
+    not_found_by_cabinet = {}
+    
     for result in results:
         product_id = result.get("product_id")
         size_id = result.get("size_id")
         size_name = result.get("size_name")
+        product_name = result.get("product_name", "Unknown")
+        cabinet_name = result.get("cabinet_name", "Unknown")
         
         if product_id in discounted_prices:
             price_data = discounted_prices[product_id]
@@ -164,6 +261,14 @@ async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Opti
                     first_price = next(iter(size_prices_by_id.values()))
                     result["price_before_spp"] = first_price
                     updated_count += 1
+                    logger.debug(
+                        f"⚠️ Товар {product_id} ({product_name}): размер {size_id}/{size_name} не найден, "
+                        f"использован первый доступный размер"
+                    )
+                else:
+                    # Товар есть в API, но нет discountedPrice для размеров
+                    result["price_before_spp"] = None
+                    not_matched_by_size.append((product_id, product_name, size_id, size_name))
             # Старая структура (для обратной совместимости)
             elif isinstance(price_data, dict):
                 if size_id is not None and size_id in price_data:
@@ -173,8 +278,40 @@ async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Opti
                     first_price = next(iter(price_data.values()))
                     result["price_before_spp"] = first_price
                     updated_count += 1
+                else:
+                    result["price_before_spp"] = None
+                    not_matched_by_size.append((product_id, product_name, size_id, size_name))
         else:
             result["price_before_spp"] = None
+            not_found_in_api.append((product_id, result.get("product_name", "Unknown"), cabinet_name))
+            # Группируем по кабинетам
+            if cabinet_name not in not_found_by_cabinet:
+                not_found_by_cabinet[cabinet_name] = []
+            not_found_by_cabinet[cabinet_name].append(product_id)
+    
+    # Логируем статистику по не найденным товарам с разбивкой по кабинетам
+    if not_found_in_api:
+        logger.warning(
+            f"⚠️ {len(not_found_in_api)} товаров не найдено в ответе discounts API"
+        )
+        
+        # Статистика по кабинетам
+        for cabinet_name, product_ids in not_found_by_cabinet.items():
+            logger.warning(
+                f"  • {cabinet_name}: {len(product_ids)} товаров не найдено "
+                f"(примеры product_id: {product_ids[:5]})"
+            )
+        
+        # Примеры всех не найденных товаров
+        logger.warning(
+            f"  Примеры не найденных товаров: {not_found_in_api[:5]}"
+        )
+    
+    if not_matched_by_size:
+        logger.warning(
+            f"⚠️ {len(not_matched_by_size)} товаров найдено в API, но размеры не совпадают "
+            f"(примеры: {not_matched_by_size[:5]})"
+        )
     
     logger.success(
         f"✅ Обновлено записей с price_before_spp: {updated_count} из {len(results)} "
@@ -278,10 +415,12 @@ async def parse_all_sellers():
     # Получаем discountedPrice для всех товаров
     if all_results:
         discounts_api_token = env_config.get("discounts_api_token")
+        discounts_tokens_by_cabinet = env_config.get("discounts_tokens_by_cabinet", {})
         all_results = await fetch_discounted_prices_for_results(
             all_results, 
             cookies=cookies,
-            discounts_api_token=discounts_api_token
+            discounts_api_token=discounts_api_token,
+            discounts_tokens_by_cabinet=discounts_tokens_by_cabinet
         )
     
     total_time = time.time() - total_start_time
