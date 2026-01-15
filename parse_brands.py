@@ -3,7 +3,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -56,13 +56,133 @@ def load_env_config() -> Dict:
         
         cookies_string = "; ".join(cookies_parts) if cookies_parts else None
         
+        discounts_api_token = os.getenv("WB_DISCOUNTS_API_TOKEN")
+        
         return {
             "dest": int(os.getenv("WB_DEST", "-3115289")),
             "spp": int(os.getenv("WB_SPP", "30")),
             "cookies": cookies_string,
+            "discounts_api_token": discounts_api_token,
         }
     except Exception:
-        return {"dest": -3115289, "spp": 30, "cookies": None}
+        return {"dest": -3115289, "spp": 30, "cookies": None, "discounts_api_token": None}
+
+
+async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Optional[str] = None, 
+                                             discounts_api_token: Optional[str] = None) -> List[Dict]:
+    """Получает discountedPrice для всех товаров из результатов парсинга.
+    
+    Args:
+        results: Список результатов парсинга с полем product_id
+        cookies: Cookies из .env для запросов
+        discounts_api_token: Токен для авторизации в discounts API
+    
+    Returns:
+        Обновленный список результатов с полем price_before_spp
+    """
+    import time
+    from src.api.wb_catalog_api import WBCatalogAPI
+    
+    if not results:
+        return results
+    
+    logger.info("\n" + "=" * 70)
+    logger.info("💰 Получение цен до СПП (discountedPrice) через официальный API")
+    logger.info("=" * 70)
+    
+    fetch_start_time = time.time()
+    
+    # Собираем уникальные product_id
+    product_ids = set()
+    for result in results:
+        product_id = result.get("product_id")
+        if product_id:
+            product_ids.add(product_id)
+    
+    logger.info(f"📊 Найдено уникальных товаров: {len(product_ids)}")
+    
+    if not product_ids:
+        logger.warning("⚠️ Не найдено product_id в результатах")
+        return results
+    
+    # Получаем discountedPrice через API
+    if not discounts_api_token:
+        logger.warning(
+            "⚠️ WB_DISCOUNTS_API_TOKEN не найден в .env файле. "
+            "Запросы к discounts API будут пропущены. "
+            "Добавьте токен в .env: WB_DISCOUNTS_API_TOKEN=your_token"
+        )
+        # Возвращаем результаты без price_before_spp
+        for result in results:
+            result["price_before_spp"] = None
+        return results
+    
+    async with WBCatalogAPI(
+        request_delay=0.1, 
+        max_concurrent=10, 
+        cookies=cookies,
+        discounts_api_token=discounts_api_token
+    ) as api:
+        discounted_prices = await api.fetch_discounted_prices(list(product_ids))
+    
+    fetch_time = time.time() - fetch_start_time
+    
+    logger.info(
+        f"✅ Получено discountedPrice для {len(discounted_prices)} товаров "
+        f"за {fetch_time:.2f} сек"
+    )
+    
+    # Сопоставляем discountedPrice с товарами
+    updated_count = 0
+    for result in results:
+        product_id = result.get("product_id")
+        size_id = result.get("size_id")
+        size_name = result.get("size_name")
+        
+        if product_id in discounted_prices:
+            price_data = discounted_prices[product_id]
+            
+            # Если это товар без размеров
+            if None in price_data:
+                result["price_before_spp"] = price_data[None]
+                updated_count += 1
+            # Если это товар с размерами (новая структура с _by_id и _by_name)
+            elif isinstance(price_data, dict) and "_by_id" in price_data:
+                size_prices_by_id = price_data.get("_by_id", {})
+                size_prices_by_name = price_data.get("_by_name", {})
+                
+                # Пытаемся найти по size_id (optionId из каталога может совпадать с sizeID из discounts API)
+                if size_id is not None and size_id in size_prices_by_id:
+                    result["price_before_spp"] = size_prices_by_id[size_id]
+                    updated_count += 1
+                # Если не нашли по ID, пытаемся найти по имени размера
+                elif size_name and size_name in size_prices_by_name:
+                    result["price_before_spp"] = size_prices_by_name[size_name]
+                    updated_count += 1
+                # Если ничего не нашли, берем первый доступный размер
+                elif size_prices_by_id:
+                    first_price = next(iter(size_prices_by_id.values()))
+                    result["price_before_spp"] = first_price
+                    updated_count += 1
+            # Старая структура (для обратной совместимости)
+            elif isinstance(price_data, dict):
+                if size_id is not None and size_id in price_data:
+                    result["price_before_spp"] = price_data[size_id]
+                    updated_count += 1
+                elif price_data:
+                    first_price = next(iter(price_data.values()))
+                    result["price_before_spp"] = first_price
+                    updated_count += 1
+        else:
+            result["price_before_spp"] = None
+    
+    logger.success(
+        f"✅ Обновлено записей с price_before_spp: {updated_count} из {len(results)} "
+        f"({updated_count/len(results)*100:.1f}%)"
+    )
+    logger.info("=" * 70)
+    
+    return results
 
 
 async def parse_all_sellers():
@@ -155,6 +275,15 @@ async def parse_all_sellers():
             logger.exception("Детали ошибки:")
             continue
     
+    # Получаем discountedPrice для всех товаров
+    if all_results:
+        discounts_api_token = env_config.get("discounts_api_token")
+        all_results = await fetch_discounted_prices_for_results(
+            all_results, 
+            cookies=cookies,
+            discounts_api_token=discounts_api_token
+        )
+    
     total_time = time.time() - total_start_time
     
     logger.info("\n" + "=" * 70)
@@ -195,6 +324,10 @@ def export_results(results: List[Dict], output_dir: Path):
         from openpyxl.utils import get_column_letter
         
         df = pd.DataFrame(results)
+        
+        # Переименовываем столбец price_before_spp на "Цена до СПП"
+        if 'price_before_spp' in df.columns:
+            df = df.rename(columns={'price_before_spp': 'Цена до СПП'})
         
         sort_columns = []
         if 'brand_name' in df.columns:
@@ -243,6 +376,13 @@ def export_results(results: List[Dict], output_dir: Path):
             filled = df['price_product'].notna().sum()
             logger.info(
                 f"💰 Заполнено цен продукта: {filled} из {len(df)} "
+                f"({filled/len(df)*100:.1f}%)"
+            )
+        
+        if 'Цена до СПП' in df.columns:
+            filled = df['Цена до СПП'].notna().sum()
+            logger.info(
+                f"💰 Заполнено цен до СПП: {filled} из {len(df)} "
                 f"({filled/len(df)*100:.1f}%)"
             )
         

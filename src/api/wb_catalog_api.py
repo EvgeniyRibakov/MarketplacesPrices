@@ -23,7 +23,7 @@ class WBCatalogAPI:
     }
     
     def __init__(self, request_delay: float = 0.1, max_concurrent: int = 5, cookies: Optional[str] = None, 
-                 auto_get_cookies: bool = True):
+                 auto_get_cookies: bool = True, discounts_api_token: Optional[str] = None):
         """Инициализация клиента.
         
         Args:
@@ -31,6 +31,7 @@ class WBCatalogAPI:
             max_concurrent: Максимальное количество параллельных запросов
             cookies: Опциональные cookies из браузера в формате "name1=value1; name2=value2"
             auto_get_cookies: Автоматически получать cookies из браузера если не переданы
+            discounts_api_token: Токен для авторизации в discounts-prices-api.wildberries.ru
         """
         self.request_delay = request_delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
@@ -39,6 +40,7 @@ class WBCatalogAPI:
         self.auto_get_cookies = auto_get_cookies
         self._cookies_header: Optional[str] = None
         self._cookies_dict: Dict[str, str] = {}  # Кэш cookies для быстрого доступа
+        self.discounts_api_token = discounts_api_token
     
     async def __aenter__(self):
         """Асинхронный контекстный менеджер - вход."""
@@ -639,3 +641,198 @@ class WBCatalogAPI:
                 })
         
         return results
+    
+    async def fetch_discounted_prices(self, nm_ids: List[int]) -> Dict[int, Dict]:
+        """Получает discountedPrice для списка артикулов через официальный discounts API.
+        
+        Args:
+            nm_ids: Список артикулов (nmID) товаров (до 1000 за запрос)
+        
+        Returns:
+            Словарь {nm_id: {size_id: discountedPrice}} для каждого товара и размера
+        """
+        if not nm_ids:
+            return {}
+        
+        DISCOUNTS_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter"
+        
+        # Разбиваем на батчи по 1000 (лимит API)
+        batch_size = 1000
+        all_results = {}
+        
+        for i in range(0, len(nm_ids), batch_size):
+            batch = nm_ids[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(nm_ids) + batch_size - 1) // batch_size
+            
+            logger.info(
+                f"📊 Запрос discountedPrice: батч {batch_num}/{total_batches} "
+                f"({len(batch)} артикулов)..."
+            )
+            
+            start_time = time.time()
+            
+            try:
+                async with self.semaphore:
+                    # Формируем заголовки
+                    headers = {
+                        "Content-Type": "application/json",
+                    }
+                    
+                    # Добавляем Authorization токен, если есть
+                    if self.discounts_api_token:
+                        headers["Authorization"] = f"Bearer {self.discounts_api_token}"
+                    elif self._cookies_header:
+                        # Fallback на cookies, если токен не указан
+                        headers["Cookie"] = self._cookies_header
+                    
+                    # POST запрос с массивом nmList
+                    response = await self.session.post(
+                        DISCOUNTS_API_URL,
+                        json={"nmList": batch},
+                        headers=headers,
+                        timeout=30
+                    )
+                    
+                    elapsed_time = time.time() - start_time
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        
+                        if data.get("error"):
+                            logger.warning(
+                                f"⚠️ API вернул ошибку для батча {batch_num}: "
+                                f"{data.get('errorText', 'Unknown error')}"
+                            )
+                            continue
+                        
+                        list_goods = data.get("data", {}).get("listGoods", [])
+                        
+                        for good in list_goods:
+                            nm_id = good.get("nmID")
+                            if not nm_id:
+                                continue
+                            
+                            sizes = good.get("sizes", [])
+                            
+                            if not sizes:
+                                # Товар без размеров - используем discountedPrice на уровне товара
+                                discounted_price = good.get("discountedPrice")
+                                if discounted_price is not None:
+                                    all_results[nm_id] = {None: discounted_price}
+                            else:
+                                # Товар с размерами - для каждого размера свой discountedPrice
+                                # Сохраняем как по sizeID, так и по techSizeName для гибкого сопоставления
+                                size_prices = {}
+                                size_prices_by_name = {}
+                                for size in sizes:
+                                    size_id = size.get("sizeID")
+                                    tech_size_name = size.get("techSizeName")
+                                    discounted_price = size.get("discountedPrice")
+                                    if discounted_price is not None:
+                                        if size_id:
+                                            size_prices[size_id] = discounted_price
+                                        if tech_size_name:
+                                            size_prices_by_name[tech_size_name] = discounted_price
+                                
+                                if size_prices:
+                                    # Сохраняем оба маппинга для гибкого сопоставления
+                                    all_results[nm_id] = {
+                                        "_by_id": size_prices,
+                                        "_by_name": size_prices_by_name
+                                    }
+                        
+                        logger.success(
+                            f"✅ Батч {batch_num}: получено данных для {len(list_goods)} товаров "
+                            f"за {elapsed_time:.2f} сек"
+                        )
+                    
+                    elif response.status_code == 429:
+                        elapsed_time = time.time() - start_time
+                        logger.warning(
+                            f"⚠️ Rate limit (429) для батча {batch_num} "
+                            f"(время: {elapsed_time:.2f} сек). Ожидание 0.6 сек..."
+                        )
+                        await asyncio.sleep(0.6)  # Минимальная задержка на грани фола
+                        # Повторяем запрос один раз
+                        async with self.semaphore:
+                            headers = {
+                                "Content-Type": "application/json",
+                            }
+                            if self.discounts_api_token:
+                                headers["Authorization"] = f"Bearer {self.discounts_api_token}"
+                            elif self._cookies_header:
+                                headers["Cookie"] = self._cookies_header
+                            
+                            response = await self.session.post(
+                                DISCOUNTS_API_URL,
+                                json={"nmList": batch},
+                                headers=headers,
+                                timeout=30
+                            )
+                            if response.status_code == 200:
+                                data = response.json()
+                                list_goods = data.get("data", {}).get("listGoods", [])
+                                for good in list_goods:
+                                    nm_id = good.get("nmID")
+                                    if not nm_id:
+                                        continue
+                                    sizes = good.get("sizes", [])
+                                    if not sizes:
+                                        discounted_price = good.get("discountedPrice")
+                                        if discounted_price is not None:
+                                            all_results[nm_id] = {None: discounted_price}
+                                    else:
+                                        size_prices = {}
+                                        size_prices_by_name = {}
+                                        for size in sizes:
+                                            size_id = size.get("sizeID")
+                                            tech_size_name = size.get("techSizeName")
+                                            discounted_price = size.get("discountedPrice")
+                                            if discounted_price is not None:
+                                                if size_id:
+                                                    size_prices[size_id] = discounted_price
+                                                if tech_size_name:
+                                                    size_prices_by_name[tech_size_name] = discounted_price
+                                        if size_prices:
+                                            all_results[nm_id] = {
+                                                "_by_id": size_prices,
+                                                "_by_name": size_prices_by_name
+                                            }
+                    
+                    else:
+                        elapsed_time = time.time() - start_time
+                        logger.error(
+                            f"❌ Ошибка запроса discountedPrice для батча {batch_num}: "
+                            f"статус {response.status_code} (время: {elapsed_time:.2f} сек)"
+                        )
+                        try:
+                            error_text = response.text[:200]
+                            logger.debug(f"Ответ сервера: {error_text}")
+                        except:
+                            pass
+                    
+                    # Минимальная задержка между запросами (на грани фола: 10 запросов за 6 сек = 0.6 сек)
+                    if i + batch_size < len(nm_ids):
+                        await asyncio.sleep(0.6)
+            
+            except asyncio.TimeoutError:
+                elapsed_time = time.time() - start_time
+                logger.error(
+                    f"❌ Таймаут при запросе discountedPrice для батча {batch_num} "
+                    f"(время ожидания: {elapsed_time:.2f} сек)"
+                )
+            except Exception as e:
+                elapsed_time = time.time() - start_time
+                logger.error(
+                    f"❌ Исключение при запросе discountedPrice для батча {batch_num} "
+                    f"(время: {elapsed_time:.2f} сек): {e}"
+                )
+                logger.exception("Детали исключения:")
+        
+        logger.info(
+            f"📊 Получено discountedPrice для {len(all_results)} товаров "
+            f"из {len(nm_ids)} запрошенных"
+        )
+        
+        return all_results
