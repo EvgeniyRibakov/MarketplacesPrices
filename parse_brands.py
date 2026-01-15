@@ -464,9 +464,17 @@ def export_results(results: List[Dict], output_dir: Path):
         
         df = pd.DataFrame(results)
         
-        # Переименовываем столбец price_before_spp на "Цена до СПП"
-        if 'price_before_spp' in df.columns:
-            df = df.rename(columns={'price_before_spp': 'Цена до СПП'})
+        # Переименовываем столбцы
+        rename_mapping = {
+            'price_before_spp': 'Цена до СПП',
+            'product_id': 'Артикул',
+            'price_basic': 'Зачёркнутая цена',
+            'price_product': 'Цена с СПП'
+        }
+        
+        for old_name, new_name in rename_mapping.items():
+            if old_name in df.columns:
+                df = df.rename(columns={old_name: new_name})
         
         # Удаляем ненужные столбцы из экспорта
         columns_to_remove = [
@@ -481,20 +489,57 @@ def export_results(results: List[Dict], output_dir: Path):
             if col in df.columns:
                 df = df.drop(columns=[col])
         
+        # Добавляем расчетные столбцы ПЕРЕД определением порядка
+        
+        # 1. Цена с картой 10% = Цена с СПП * 0.9
+        if 'Цена с СПП' in df.columns:
+            df['Цена с картой 10%'] = df['Цена с СПП'].apply(
+                lambda x: x * 0.9 if x is not None and pd.notna(x) else None
+            )
+        
+        # 2. Процент СПП = (Цена до СПП - Цена с СПП) / Цена до СПП * 100
+        if 'Цена до СПП' in df.columns and 'Цена с СПП' in df.columns:
+            def calculate_spp_percent(row):
+                price_before_spp = row.get('Цена до СПП')
+                price_prod = row.get('Цена с СПП')
+                product_id = row.get('Артикул', 'Unknown')
+                
+                # Проверяем на None и на ноль
+                if price_before_spp is None or pd.isna(price_before_spp) or price_before_spp == 0:
+                    return None
+                if price_prod is None or pd.isna(price_prod):
+                    return None
+                
+                # Вычисляем процент
+                percent = ((price_before_spp - price_prod) / price_before_spp) * 100
+                
+                # Проверяем на отрицательное значение (это баг)
+                if percent < 0:
+                    logger.warning(
+                        f"⚠️ Отрицательный процент СПП для товара {product_id}: "
+                        f"{percent:.2f}% (Цена до СПП={price_before_spp}, Цена с СПП={price_prod})"
+                    )
+                
+                return percent
+            
+            df['Процент СПП'] = df.apply(calculate_spp_percent, axis=1)
+        
         # Определяем порядок столбцов для экспорта
         desired_order = [
             'brand_id',
             'brand_name',
-            'product_id',
+            'Артикул',
             'product_name',
             'cabinet_id',
             'cabinet_name',
             'supplier_id',
             'supplier_name',
             'size_id',
-            'price_basic',
-            'price_product',
-            'Цена до СПП'
+            'Зачёркнутая цена',
+            'Цена до СПП',
+            'Цена с СПП',
+            'Цена с картой 10%',
+            'Процент СПП'
         ]
         
         # Оставляем только существующие столбцы в нужном порядке
@@ -539,17 +584,17 @@ def export_results(results: List[Dict], output_dir: Path):
         logger.info(f"📊 Всего строк: {len(df)}")
         logger.info(f"📋 Колонки: {', '.join(df.columns.tolist())}")
         
-        if 'price_basic' in df.columns:
-            filled = df['price_basic'].notna().sum()
+        if 'Зачёркнутая цена' in df.columns:
+            filled = df['Зачёркнутая цена'].notna().sum()
             logger.info(
-                f"💰 Заполнено базовых цен: {filled} из {len(df)} "
+                f"💰 Заполнено зачёркнутых цен: {filled} из {len(df)} "
                 f"({filled/len(df)*100:.1f}%)"
             )
         
-        if 'price_product' in df.columns:
-            filled = df['price_product'].notna().sum()
+        if 'Цена с СПП' in df.columns:
+            filled = df['Цена с СПП'].notna().sum()
             logger.info(
-                f"💰 Заполнено цен продукта: {filled} из {len(df)} "
+                f"💰 Заполнено цен с СПП: {filled} из {len(df)} "
                 f"({filled/len(df)*100:.1f}%)"
             )
         
@@ -557,6 +602,20 @@ def export_results(results: List[Dict], output_dir: Path):
             filled = df['Цена до СПП'].notna().sum()
             logger.info(
                 f"💰 Заполнено цен до СПП: {filled} из {len(df)} "
+                f"({filled/len(df)*100:.1f}%)"
+            )
+        
+        if 'Цена с картой 10%' in df.columns:
+            filled = df['Цена с картой 10%'].notna().sum()
+            logger.info(
+                f"💰 Заполнено цен с картой 10%: {filled} из {len(df)} "
+                f"({filled/len(df)*100:.1f}%)"
+            )
+        
+        if 'Процент СПП' in df.columns:
+            filled = df['Процент СПП'].notna().sum()
+            logger.info(
+                f"📊 Заполнено процентов СПП: {filled} из {len(df)} "
                 f"({filled/len(df)*100:.1f}%)"
             )
         
