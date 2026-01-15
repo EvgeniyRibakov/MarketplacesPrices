@@ -468,6 +468,41 @@ def export_results(results: List[Dict], output_dir: Path):
         if 'price_before_spp' in df.columns:
             df = df.rename(columns={'price_before_spp': 'Цена до СПП'})
         
+        # Удаляем ненужные столбцы из экспорта
+        columns_to_remove = [
+            'size_name',
+            'price_card',
+            'source_price_basic',
+            'source_price_product',
+            'source_price_card'
+        ]
+        
+        for col in columns_to_remove:
+            if col in df.columns:
+                df = df.drop(columns=[col])
+        
+        # Определяем порядок столбцов для экспорта
+        desired_order = [
+            'brand_id',
+            'brand_name',
+            'product_id',
+            'product_name',
+            'cabinet_id',
+            'cabinet_name',
+            'supplier_id',
+            'supplier_name',
+            'size_id',
+            'price_basic',
+            'price_product',
+            'Цена до СПП'
+        ]
+        
+        # Оставляем только существующие столбцы в нужном порядке
+        existing_columns = [col for col in desired_order if col in df.columns]
+        # Добавляем остальные столбцы (если есть), которые не в списке
+        other_columns = [col for col in df.columns if col not in desired_order]
+        df = df[existing_columns + other_columns]
+        
         sort_columns = []
         if 'brand_name' in df.columns:
             sort_columns.append('brand_name')
