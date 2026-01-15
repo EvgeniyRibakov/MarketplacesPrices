@@ -71,39 +71,15 @@ class BrowserCookiesExtractor:
             if path.exists():
                 # Ищем все подпапки (профили)
                 try:
-                    # Список известных профилей для проверки в первую очередь
-                    known_profiles = ["Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4"]
-                    
-                    # Сначала проверяем известные профили
-                    for profile_name in known_profiles:
-                        cookies_path = path / profile_name / "Cookies"
-                        if cookies_path.exists():
-                            logger.info(f"Найден путь к Chrome: {path} (профиль: {profile_name})")
-                            self.profile = profile_name
-                            return path
-                    
-                    # Затем проверяем все остальные папки
                     for item in path.iterdir():
-                        if item.is_dir() and not item.name.startswith('.') and item.name not in known_profiles:
-                            # Пропускаем системные папки
-                            if item.name in ["Crashpad", "ShaderCache", "GrShaderCache", "BrowserMetrics", 
-                                           "CertificateRevocation", "component_crx_cache", "extensions_crx_cache",
-                                           "Local Traces", "MediaFoundationWidevineCdm", "Notification Resources",
-                                           "OptimizationHints", "PKIMetadata", "Safe Browsing", "SSLErrorAssistant",
-                                           "Subresource Filter", "System Profile", "Webstore Downloads",
-                                           "WidevineCdm", "ZxcvbnData", "Guest Profile"]:
-                                continue
-                            
+                        if item.is_dir() and not item.name.startswith('.'):
                             cookies_path = item / "Cookies"
                             if cookies_path.exists():
                                 logger.info(f"Найден путь к Chrome: {path} (профиль: {item.name})")
-                                self.profile = item.name
+                                self.profile = item.name  # Обновляем профиль
                                 return path
                 except PermissionError:
                     logger.debug(f"Нет доступа к {path}")
-                    continue
-                except Exception as e:
-                    logger.debug(f"Ошибка при проверке {path}: {e}")
                     continue
         
         logger.warning("Не удалось найти путь к Chrome автоматически")
@@ -119,18 +95,6 @@ class BrowserCookiesExtractor:
         
         if not cookies_path.exists():
             logger.warning(f"Файл cookies не найден: {cookies_path}")
-            logger.debug(f"Проверяемый профиль: {self.profile}, путь к Chrome: {self._chrome_path}")
-            return None
-        
-        # Проверяем размер файла (не должен быть пустым)
-        try:
-            file_size = cookies_path.stat().st_size
-            if file_size == 0:
-                logger.warning(f"Файл cookies пустой: {cookies_path}")
-                return None
-            logger.debug(f"Файл cookies найден: {cookies_path} (размер: {file_size} байт)")
-        except Exception as e:
-            logger.warning(f"Ошибка при проверке файла cookies: {e}")
             return None
         
         return cookies_path
@@ -224,31 +188,16 @@ class BrowserCookiesExtractor:
             conn = sqlite3.connect(str(temp_db))
             cursor = conn.cursor()
             
-            # Запрос для получения cookies для домена (все варианты)
+            # Запрос для получения cookies для домена
             query = """
                 SELECT name, value, encrypted_value, host_key
                 FROM cookies
-                WHERE host_key LIKE ? 
-                   OR host_key LIKE ?
-                   OR host_key LIKE ?
-                   OR host_key LIKE ?
-                   OR host_key = ?
+                WHERE host_key LIKE ? OR host_key LIKE ?
                 ORDER BY creation_utc DESC
             """
             
-            # Проверяем все варианты домена
-            domain_patterns = [
-                f"%{domain}%",           # wildberries.ru где-то в домене
-                f"%.{domain}",           # .wildberries.ru
-                f"%www.{domain}",        # www.wildberries.ru
-                f"%.www.{domain}",       # .www.wildberries.ru
-                domain                    # точное совпадение
-            ]
-            
-            cursor.execute(query, domain_patterns)
+            cursor.execute(query, (f"%{domain}", f".{domain}"))
             rows = cursor.fetchall()
-            
-            logger.debug(f"Найдено {len(rows)} записей cookies в БД для домена {domain}")
             
             for name, value, encrypted_value, host_key in rows:
                 # Пробуем использовать обычное значение, если оно есть
@@ -261,19 +210,8 @@ class BrowserCookiesExtractor:
                     continue
                 
                 if cookie_value and name:
-                    # Сохраняем последнее значение для каждого cookie (если есть дубликаты)
                     cookies[name] = cookie_value
-                    logger.debug(f"Извлечен cookie из БД: {name} для {host_key}")
-            
-            # Логируем какие важные cookies получены из БД
-            found_important_db = [c for c in self.REQUIRED_COOKIES if c in cookies]
-            missing_important_db = [c for c in self.REQUIRED_COOKIES if c not in cookies]
-            
-            if found_important_db:
-                logger.debug(f"Важные cookies из БД: {', '.join(found_important_db)}")
-            if missing_important_db:
-                logger.debug(f"Отсутствуют важные cookies в БД: {', '.join(missing_important_db)}")
-                logger.debug(f"Все cookies из БД: {list(cookies.keys())}")
+                    logger.debug(f"Извлечен cookie: {name} для {host_key}")
             
             conn.close()
             
@@ -320,35 +258,17 @@ class BrowserCookiesExtractor:
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-blink-features=AutomationControlled")
-            # Не используем add_experimental_option - undetected-chromedriver сам управляет опциями для обхода детекции
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
             
             # Используем профиль Chrome если доступен
-            # ВАЖНО: Нельзя использовать существующий профиль в headless режиме, если Chrome запущен
-            # Поэтому создаем временный профиль или используем без профиля
-            # Но если Chrome закрыт, можно использовать существующий профиль
-            use_existing_profile = False
+            # _chrome_path уже указывает на папку "User Data" (например, C:\Users\...\Chrome\User Data)
+            # Для --user-data-dir нужно передать этот путь напрямую, без .parent
             if self._chrome_path:
-                cookies_path = self._chrome_path / self.profile / "Cookies"
-                # Проверяем, заблокирован ли файл (Chrome запущен)
-                try:
-                    # Пробуем открыть файл на чтение
-                    with open(cookies_path, 'rb'):
-                        use_existing_profile = True
-                except (PermissionError, FileNotFoundError):
-                    # Файл заблокирован или не существует - используем без профиля
-                    use_existing_profile = False
-                    logger.debug("Профиль Chrome заблокирован или недоступен, используем без профиля")
-            
-            if use_existing_profile and self._chrome_path:
-                user_data_dir = str(self._chrome_path.parent)
+                user_data_dir = str(self._chrome_path)
                 options.add_argument(f"--user-data-dir={user_data_dir}")
                 options.add_argument(f"--profile-directory={self.profile}")
-                logger.debug(f"Используем профиль Chrome: {self.profile}")
-            else:
-                logger.debug("Используем headless Chrome без профиля (создаст новые cookies)")
             
-            # undetected-chromedriver сам управляет опциями для обхода детекции
-            # Не передаем use_subprocess=True, так как это может вызвать проблемы
             driver = uc.Chrome(options=options, version_main=None)
             
             try:
@@ -357,100 +277,24 @@ class BrowserCookiesExtractor:
                 driver.get(url)
                 
                 # Ждем загрузки страницы
-                WebDriverWait(driver, 15).until(
+                WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.TAG_NAME, "body"))
                 )
                 
-                # Проверяем, есть ли антибот-челлендж на странице
+                # Небольшая задержка для получения cookies
                 import time
-                challenge_detected = False
-                try:
-                    # Ищем признаки антибот-челленджа
-                    page_source = driver.page_source.lower()
-                    if "почти готово" in page_source or "antibot" in page_source or "challenge" in page_source:
-                        challenge_detected = True
-                        logger.info("Обнаружен антибот-челлендж, ожидаем его завершения...")
-                except:
-                    pass
-                
-                # Имитация поведения пользователя для прохождения челленджа
-                if challenge_detected:
-                    # Прокручиваем страницу несколько раз
-                    for i in range(3):
-                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                        time.sleep(1)
-                        driver.execute_script("window.scrollTo(0, 0);")
-                        time.sleep(1)
-                    
-                    # Ждем завершения челленджа (до 30 секунд)
-                    max_wait = 30
-                    waited = 0
-                    while waited < max_wait:
-                        try:
-                            page_source = driver.page_source.lower()
-                            # Проверяем, что челлендж завершен (нет признаков челленджа)
-                            if "почти готово" not in page_source and "challenge" not in page_source:
-                                # Проверяем, что страница загрузилась нормально
-                                if "wildberries" in page_source and len(page_source) > 10000:
-                                    logger.info(f"Антибот-челлендж пройден через {waited} секунд")
-                                    break
-                        except:
-                            pass
-                        time.sleep(2)
-                        waited += 2
-                    
-                    if waited >= max_wait:
-                        logger.warning("Таймаут ожидания завершения антибот-челленджа")
-                else:
-                    # Если челленджа нет, все равно делаем небольшую прокрутку
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-                    time.sleep(2)
-                
-                # Дополнительная задержка для установки cookies
                 time.sleep(3)
                 
                 # Получаем все cookies
                 selenium_cookies = driver.get_cookies()
                 
-                # Логируем все полученные cookies для диагностики
-                logger.debug(f"Всего получено cookies через Selenium: {len(selenium_cookies)}")
-                
-                # Принимаем cookies для всех вариантов домена wildberries
-                domain_variants = [domain, f".{domain}", f"www.{domain}", f".www.{domain}"]
-                
                 for cookie in selenium_cookies:
-                    cookie_domain = cookie.get("domain", "")
-                    cookie_name = cookie.get("name", "")
-                    cookie_value = cookie.get("value", "")
-                    
-                    # Проверяем все варианты домена
-                    domain_match = False
-                    for variant in domain_variants:
-                        if variant in cookie_domain or cookie_domain in variant:
-                            domain_match = True
-                            break
-                    
-                    # Также принимаем cookies без указания домена (session cookies)
-                    if not cookie_domain or domain_match:
-                        if cookie_name and cookie_value:
-                            cookies[cookie_name] = cookie_value
-                            logger.debug(f"Получен cookie через Selenium: {cookie_name} (домен: {cookie_domain or 'session'})")
-                
-                # Логируем какие важные cookies получены
-                found_important = [c for c in self.REQUIRED_COOKIES if c in cookies]
-                missing_important = [c for c in self.REQUIRED_COOKIES if c not in cookies]
-                
-                if found_important:
-                    logger.info(f"✓ Получены важные cookies через headless: {', '.join(found_important)}")
-                if missing_important:
-                    logger.warning(f"⚠ Не получены важные cookies через headless: {', '.join(missing_important)}")
-                    logger.debug(f"Все полученные cookies: {list(cookies.keys())}")
+                    if domain in cookie.get("domain", ""):
+                        cookies[cookie["name"]] = cookie["value"]
+                        logger.debug(f"Получен cookie через Selenium: {cookie['name']}")
                 
             finally:
-                try:
-                    driver.quit()
-                except:
-                    pass  # Игнорируем ошибки при закрытии
+                driver.quit()
                 
         except ImportError:
             logger.error("undetected-chromedriver не установлен. Установите: python -m pip install undetected-chromedriver")

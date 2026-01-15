@@ -168,47 +168,75 @@ class WBCatalogAPI:
             logger.info("Инициализация сессии: получение cookies с главной страницы...")
             
             # Делаем запрос на главную страницу для получения базовых cookies
-            async with self.session.get("https://www.wildberries.ru/") as response:
-                cookies_count = len(self.session.cookie_jar)
-                logger.info(f"Получено cookies с главной страницы: {cookies_count}")
-                
-                # Обновляем cookies из ответа
-                if response.cookies:
-                    for cookie in response.cookies:
-                        self.session.cookie_jar.update_cookies({cookie.key: cookie.value}, response.url)
-                
-                # Небольшая задержка для имитации поведения браузера
-                await asyncio.sleep(1.0)
-                
-                # Пробуем получить токен антибота через разные эндпоинты
-                token_urls = [
-                    "https://www.wildberries.ru/__wbaas/challenges/antibot/token",
-                    "https://www.wildberries.ru/__wbaas/challenges/antibot/verify"
-                ]
-                
-                for token_url in token_urls:
-                    try:
-                        async with self.session.get(token_url, headers={
-                            "Accept": "application/json",
-                            "Referer": "https://www.wildberries.ru/",
-                        }) as token_response:
-                            if token_response.status == 200:
-                                token_data = await token_response.json()
-                                logger.debug(f"Токен антибота получен с {token_url}")
-                                # Сохраняем токен если он есть в ответе
-                                if isinstance(token_data, dict) and "token" in token_data:
-                                    token = token_data["token"]
-                                    self.session.cookie_jar.update_cookies(
-                                        {"x_wbaas_token": token}, 
-                                        response.url
-                                    )
-                                    logger.debug("Токен добавлен в cookies")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            }
+            
+            # Добавляем cookies если есть
+            if self._cookies_header:
+                headers["Cookie"] = self._cookies_header
+            
+            response = await self.session.get("https://www.wildberries.ru/", headers=headers)
+            
+            # Обновляем cookies из ответа
+            if response.cookies:
+                for name, value in response.cookies.items():
+                    self._cookies_dict[name] = value
+                # Обновляем заголовок cookies
+                self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
+            
+            cookies_count = len(self._cookies_dict)
+            logger.info(f"Получено cookies с главной страницы: {cookies_count}")
+            
+            # Небольшая задержка для имитации поведения браузера
+            await asyncio.sleep(1.0)
+            
+            # Пробуем получить токен антибота через разные эндпоинты
+            token_urls = [
+                "https://www.wildberries.ru/__wbaas/challenges/antibot/token",
+                "https://www.wildberries.ru/__wbaas/challenges/antibot/verify"
+            ]
+            
+            for token_url in token_urls:
+                try:
+                    token_headers = {
+                        "Accept": "application/json",
+                        "Referer": "https://www.wildberries.ru/",
+                    }
+                    if self._cookies_header:
+                        token_headers["Cookie"] = self._cookies_header
+                    
+                    token_response = await self.session.get(token_url, headers=token_headers)
+                    if token_response.status_code == 200:
+                        try:
+                            token_data = token_response.json()
+                            logger.debug(f"Токен антибота получен с {token_url}")
+                            # Сохраняем токен если он есть в ответе
+                            if isinstance(token_data, dict) and "token" in token_data:
+                                token = token_data["token"]
+                                self._cookies_dict["x_wbaas_token"] = token
+                                self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
+                                logger.debug("Токен добавлен в cookies")
                                 break
-                            else:
-                                logger.debug(f"Токен не получен с {token_url}: статус {token_response.status}")
-                    except Exception as e:
-                        logger.debug(f"Ошибка при получении токена с {token_url}: {e}")
-                        continue
+                        except Exception:
+                            pass
+                    else:
+                        logger.debug(f"Токен не получен с {token_url}: статус {token_response.status_code}")
+                except Exception as e:
+                    logger.debug(f"Ошибка при получении токена с {token_url}: {e}")
+                    continue
                         
         except Exception as e:
             logger.warning(f"Не удалось инициализировать сессию: {e}, продолжаем...")
@@ -216,7 +244,7 @@ class WBCatalogAPI:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Асинхронный контекстный менеджер - выход."""
         if self.session:
-            await self.session.aclose()
+            await self.session.close()
     
     def _build_url(self, brand_id: int, dest: int, spp: int = 30, 
                    page: int = 1, fsupplier: Optional[str] = None) -> str:
