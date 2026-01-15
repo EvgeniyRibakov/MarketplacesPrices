@@ -461,7 +461,16 @@ class WBCatalogAPI:
         supplier_id = product.get("supplierId")
         supplier_name = product.get("supplier", "")
         
-        cabinet_name = WBCatalogAPI.CABINET_MAPPING.get(supplier_id, f"UNKNOWN_{supplier_id}")
+        # Фильтруем товары: обрабатываем только товары из разрешенных кабинетов
+        if supplier_id is None:
+            # Если supplier_id отсутствует - это баг, пропускаем товар
+            return []
+        
+        if supplier_id not in WBCatalogAPI.CABINET_MAPPING:
+            # Пропускаем товары от перекупов (не из разрешенных кабинетов)
+            return []
+        
+        cabinet_name = WBCatalogAPI.CABINET_MAPPING[supplier_id]
         cabinet_id = supplier_id
         
         sizes = product.get("sizes", [])
