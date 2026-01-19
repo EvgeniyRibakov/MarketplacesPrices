@@ -1,5 +1,6 @@
 """Модуль для работы с публичным API каталога продавца Ozon (entrypoint)."""
 import asyncio
+import re
 import time
 from typing import List, Dict, Optional
 from urllib.parse import urlencode, quote
@@ -1259,39 +1260,142 @@ class OzonCatalogAPI:
             original_price = None
             discount_percent = None
             
+            # Ищем цены в разных форматах
             for state in main_state:
-                if state.get("type") == "priceV2":
+                state_type = state.get("type")
+                
+                # Формат 1: priceV2 (основной формат)
+                if state_type == "priceV2":
                     price_v2 = state.get("priceV2", {})
                     prices = price_v2.get("price", [])
                     
-                    for price_item in prices:
-                        text_style = price_item.get("textStyle")
-                        price_text = price_item.get("text", "")
-                        
-                        # Извлекаем числовое значение из строки "548 ₽"
-                        price_value = price_text.replace("₽", "").replace(" ", "").strip()
-                        
-                        try:
-                            price_value = float(price_value)
-                        except:
-                            continue
-                        
-                        if text_style == "PRICE":
-                            current_price = price_value
-                        elif text_style == "ORIGINAL_PRICE":
-                            original_price = price_value
+                    # Если prices - это список
+                    if isinstance(prices, list):
+                        for price_item in prices:
+                            text_style = price_item.get("textStyle")
+                            price_text = price_item.get("text", "")
+                            
+                            # Извлекаем числовое значение из строки "548 ₽" или "1 548 ₽"
+                            price_value_str = price_text.replace("₽", "").replace(" ", "").replace("\u00A0", "").strip()
+                            
+                            try:
+                                price_value = float(price_value_str)
+                            except:
+                                # Пробуем извлечь число из строки с помощью регулярного выражения
+                                import re
+                                numbers = re.findall(r'\d+', price_text.replace(" ", "").replace("\u00A0", ""))
+                                if numbers:
+                                    try:
+                                        price_value = float("".join(numbers))
+                                    except:
+                                        continue
+                                else:
+                                    continue
+                            
+                            if text_style == "PRICE":
+                                if current_price is None:  # Берем первое найденное значение
+                                    current_price = price_value
+                            elif text_style == "ORIGINAL_PRICE":
+                                if original_price is None:  # Берем первое найденное значение
+                                    original_price = price_value
+                            elif text_style is None and current_price is None:
+                                # Если textStyle отсутствует, но есть цена - используем как текущую
+                                current_price = price_value
+                    
+                    # Также проверяем прямые поля в price_v2
+                    if current_price is None:
+                        # Пробуем извлечь из поля "price" напрямую
+                        direct_price = price_v2.get("price")
+                        if isinstance(direct_price, (int, float)):
+                            current_price = float(direct_price)
+                        elif isinstance(direct_price, str):
+                            try:
+                                current_price = float(direct_price.replace(" ", "").replace("₽", "").replace("\u00A0", ""))
+                            except:
+                                pass
+                    
+                    if original_price is None:
+                        # Пробуем извлечь из поля "originalPrice" или "oldPrice"
+                        original_price_val = price_v2.get("originalPrice") or price_v2.get("oldPrice")
+                        if isinstance(original_price_val, (int, float)):
+                            original_price = float(original_price_val)
+                        elif isinstance(original_price_val, str):
+                            try:
+                                original_price = float(original_price_val.replace(" ", "").replace("₽", "").replace("\u00A0", ""))
+                            except:
+                                pass
                     
                     # Извлекаем процент скидки
                     discount_text = price_v2.get("discount", "")
                     if discount_text:
-                        # Извлекаем числовое значение из "−68%"
-                        discount_value = discount_text.replace("−", "").replace("%", "").strip()
+                        # Извлекаем числовое значение из "−68%" или "-68%"
+                        discount_value = discount_text.replace("−", "-").replace("%", "").replace(" ", "").strip()
                         try:
-                            discount_percent = float(discount_value)
+                            discount_percent = abs(float(discount_value))  # Берем абсолютное значение
                         except:
                             pass
                     
-                    break
+                    # Если нашли хотя бы одну цену, выходим
+                    if current_price is not None or original_price is not None:
+                        break
+                
+                # Формат 2: price (альтернативный формат)
+                elif state_type == "price":
+                    price_data = state.get("price", {})
+                    if isinstance(price_data, dict):
+                        # Пробуем извлечь цену из разных полей
+                        if current_price is None:
+                            price_val = price_data.get("value") or price_data.get("price") or price_data.get("current")
+                            if isinstance(price_val, (int, float)):
+                                current_price = float(price_val)
+                            elif isinstance(price_val, str):
+                                try:
+                                    current_price = float(price_val.replace(" ", "").replace("₽", "").replace("\u00A0", ""))
+                                except:
+                                    pass
+                        
+                        if original_price is None:
+                            original_val = price_data.get("original") or price_data.get("old") or price_data.get("originalPrice")
+                            if isinstance(original_val, (int, float)):
+                                original_price = float(original_val)
+                            elif isinstance(original_val, str):
+                                try:
+                                    original_price = float(original_val.replace(" ", "").replace("₽", "").replace("\u00A0", ""))
+                                except:
+                                    pass
+            
+            # Если не нашли цены в mainState, проверяем другие места в item
+            if current_price is None or original_price is None:
+                # Проверяем прямые поля в item
+                if current_price is None:
+                    item_price = item.get("price") or item.get("currentPrice")
+                    if isinstance(item_price, (int, float)):
+                        current_price = float(item_price)
+                    elif isinstance(item_price, str):
+                        try:
+                            current_price = float(item_price.replace(" ", "").replace("₽", "").replace("\u00A0", ""))
+                        except:
+                            pass
+                
+                if original_price is None:
+                    item_original = item.get("originalPrice") or item.get("oldPrice") or item.get("priceOriginal")
+                    if isinstance(item_original, (int, float)):
+                        original_price = float(item_original)
+                    elif isinstance(item_original, str):
+                        try:
+                            original_price = float(item_original.replace(" ", "").replace("₽", "").replace("\u00A0", ""))
+                        except:
+                            pass
+            
+            # Логируем товары без цен для диагностики
+            if current_price is None:
+                logger.debug(f"⚠️ Товар SKU {sku} не имеет цены покупателя. mainState типы: {[s.get('type') for s in main_state]}")
+            
+            if original_price is None and current_price is not None:
+                # Если есть текущая цена, но нет зачёркнутой - это нормально (нет скидки)
+                pass
+            elif original_price is None and current_price is None:
+                logger.debug(f"⚠️ Товар SKU {sku} не имеет ни одной цены")
             
             return {
                 "sku": sku,
@@ -1304,4 +1408,5 @@ class OzonCatalogAPI:
             
         except Exception as e:
             logger.debug(f"Ошибка при парсинге товара: {e}")
+            logger.debug(f"Детали ошибки:", exc_info=True)
             return None
