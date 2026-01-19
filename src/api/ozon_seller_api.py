@@ -53,9 +53,12 @@ class OzonSellerAPI:
                                    limit: int = 1000) -> List[Dict]:
         """Получает цены товаров через /v5/product/info/prices.
         
+        ИСПРАВЛЕНИЕ: Если не переданы фильтры (offer_ids и product_ids), 
+        возвращает ВСЕ товары продавца (visibility: ALL).
+        
         Args:
-            offer_ids: Список offer_id товаров (артикулы продавца)
-            product_ids: Список product_id товаров (SKU Ozon)
+            offer_ids: Список offer_id товаров (артикулы продавца). Если None - все товары
+            product_ids: Список product_id товаров (SKU Ozon). Если None - все товары
             limit: Количество товаров за запрос (max 1000)
         
         Returns:
@@ -66,11 +69,17 @@ class OzonSellerAPI:
         cursor = ""
         page = 1
         
-        logger.info(
-            f"🚀 Запрос цен товаров из Seller API: "
-            f"offer_ids={len(offer_ids) if offer_ids else 0}, "
-            f"product_ids={len(product_ids) if product_ids else 0}"
-        )
+        # Определяем режим работы
+        if offer_ids or product_ids:
+            logger.info(
+                f"🚀 Запрос цен товаров из Seller API (с фильтрами): "
+                f"offer_ids={len(offer_ids) if offer_ids else 0}, "
+                f"product_ids={len(product_ids) if product_ids else 0}"
+            )
+        else:
+            logger.info(
+                f"🚀 Запрос ВСЕХ товаров продавца из Seller API (без фильтров)"
+            )
         
         while True:
             start_time = time.time()
@@ -80,7 +89,7 @@ class OzonSellerAPI:
                     await asyncio.sleep(self.request_delay)
                     
                     # Формируем фильтр
-                    filter_data = {'visibility': 'ALL'}
+                    filter_data = {'visibility': 'ALL'}  # Получаем все товары (видимые и невидимые)
                     
                     if offer_ids:
                         filter_data['offer_id'] = [str(x) for x in offer_ids]

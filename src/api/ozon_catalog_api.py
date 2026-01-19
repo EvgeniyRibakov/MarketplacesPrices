@@ -6,6 +6,7 @@ from urllib.parse import urlencode, quote
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import DNSError, RequestException
 from loguru import logger
+from src.exceptions import OzonAntibotException
 
 
 class OzonCatalogAPI:
@@ -18,37 +19,46 @@ class OzonCatalogAPI:
         176640: "COSMO_BEAUTY",
     }
     
-    def __init__(self, request_delay: float = 1.0, max_concurrent: int = 3, 
-                 auto_get_cookies: bool = True, cookies: Optional[str] = None):
+    def __init__(self, request_delay: float = 3.0, max_concurrent: int = 2, 
+                 auto_get_cookies: bool = True, cookies: Optional[str] = None,
+                 proxy: Optional[str] = None):
         """Инициализация клиента.
         
         Args:
-            request_delay: Задержка между запросами (секунды) - безопасное значение 1.0
+            request_delay: Задержка между запросами (секунды) - рекомендуется 3-5 сек для обхода антибота
             max_concurrent: Максимальное количество параллельных запросов
             auto_get_cookies: Автоматически получать cookies из браузера если не переданы
             cookies: Опциональные cookies из браузера в формате "name1=value1; name2=value2"
+            proxy: Опциональный прокси-сервер в формате "http://host:port" или "socks5://host:port"
         """
         self.request_delay = request_delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[AsyncSession] = None
         self.auto_get_cookies = auto_get_cookies
         self.custom_cookies = cookies
+        self.proxy = proxy
         self._cookies_header: Optional[str] = None
         self._cookies_dict: Dict[str, str] = {}
+        self._antibot_triggered_count: int = 0  # Счетчик срабатываний антибота
     
     async def __aenter__(self):
         """Асинхронный контекстный менеджер - вход."""
         # Создаем сессию curl_cffi с эмуляцией Chrome 131
+        # Используем более полную эмуляцию браузера
         self.session = AsyncSession(
             impersonate="chrome131",
             timeout=30,
+            # Дополнительные параметры для лучшей эмуляции браузера
+            verify=True,  # Проверка SSL сертификатов
+            allow_redirects=True,  # Следовать редиректам как браузер
         )
         
         # Загружаем cookies если нужно
-        # ВАРИАНТ 5: Используем ТОЛЬКО curl_cffi для получения cookies (универсально, без браузера)
         if self.custom_cookies:
             await self._load_custom_cookies()
-        # НЕ используем headless Chrome - только curl_cffi для универсальности
+        elif self.auto_get_cookies:
+            # Пробуем автоматически получить cookies из браузера (как в WB парсере)
+            await self._load_cookies_from_browser()
         
         # Инициализируем сессию с главной страницы (получаем cookies через curl_cffi)
         init_success = await self._initialize_session()
@@ -58,15 +68,40 @@ class OzonCatalogAPI:
         return self
     
     async def _load_cookies_from_browser(self):
-        """Автоматически загружает cookies из браузера Chrome.
-        
-        ОТКЛЮЧЕНО: Используем только curl_cffi для универсальности (не требует настройки браузера).
-        Cookies получаются через curl_cffi в _initialize_session().
-        """
-        # Метод отключен - используем только curl_cffi для получения cookies
-        # Это делает код универсальным и не требует настройки браузера
-        logger.debug("Получение cookies через браузер отключено - используем только curl_cffi")
-        pass
+        """Автоматически загружает cookies из браузера Chrome (как в WB парсере)."""
+        try:
+            # Импортируем в функции, чтобы не было проблем если библиотека не установлена
+            import sys
+            from pathlib import Path
+            # Добавляем путь к корню проекта для импорта
+            project_root = Path(__file__).parent.parent.parent
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            
+            from src.utils.browser_cookies import get_ozon_cookies
+            
+            logger.info("Попытка автоматического получения cookies Ozon из браузера Chrome...")
+            
+            # Получаем cookies (синхронная функция, но вызываем в executor)
+            loop = asyncio.get_event_loop()
+            cookies_string = await loop.run_in_executor(None, get_ozon_cookies, True)
+            
+            if cookies_string:
+                self.custom_cookies = cookies_string
+                await self._load_custom_cookies()
+                logger.success("✓ Cookies Ozon успешно получены из браузера")
+            else:
+                logger.warning("Не удалось получить cookies Ozon из браузера автоматически")
+                logger.info("Продолжаем с получением cookies через curl_cffi...")
+                
+        except ImportError as e:
+            logger.warning(f"Библиотеки для работы с браузером не установлены: {e}")
+            logger.info("Установите: python -m pip install undetected-chromedriver selenium")
+            logger.info("Продолжаем с получением cookies через curl_cffi...")
+        except Exception as e:
+            logger.warning(f"Ошибка при автоматическом получении cookies Ozon: {e}")
+            logger.debug("Детали ошибки:", exc_info=True)
+            logger.info("Продолжаем с получением cookies через curl_cffi...")
     
     async def _load_custom_cookies(self):
         """Загружает cookies из строки формата 'name1=value1; name2=value2'."""
@@ -97,11 +132,12 @@ class OzonCatalogAPI:
         try:
             logger.info("Инициализация сессии: получение cookies с главной страницы Ozon через curl_cffi...")
             
+            # Полный набор заголовков для максимальной эмуляции браузера Chrome
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
                 "Sec-Fetch-Dest": "document",
@@ -111,6 +147,8 @@ class OzonCatalogAPI:
                 "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
+                "DNT": "1",  # Do Not Track - браузеры обычно отправляют
+                "Cache-Control": "max-age=0",  # Браузер обычно отправляет это при первой загрузке
             }
             
             # Добавляем cookies если есть (из браузера)
@@ -129,8 +167,19 @@ class OzonCatalogAPI:
             
             for attempt in range(max_retries):
                 try:
-                    response = await self.session.get("https://www.ozon.ru/", headers=headers)
-                    break  # Успешно
+                    # Делаем запрос с полной эмуляцией браузера
+                    response = await self.session.get(
+                        "https://www.ozon.ru/", 
+                        headers=headers,
+                        allow_redirects=True,  # Следовать редиректам как браузер
+                    )
+                    
+                    # Принимаем ответ даже при 403 (можем получить cookies)
+                    if response.status_code in [200, 403]:
+                        if response.status_code == 403:
+                            logger.warning(f"⚠️ Получен 403 при инициализации (попытка {attempt + 1}/{max_retries}), но продолжаем для получения cookies")
+                        break  # Успешно получили ответ
+                        
                 except DNSError as e:
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2
@@ -224,16 +273,28 @@ class OzonCatalogAPI:
                 try:
                     logger.debug(f"Делаем запрос на {description} ({url_to_visit}) для получения дополнительных cookies...")
                     
-                    page_headers = headers.copy()
-                    page_headers.update({
-                        "Referer": "https://www.ozon.ru/" if url_to_visit != "https://www.ozon.ru/" else None,
+                    # Создаем заголовки для каждой страницы с правильными Referer
+                    page_headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                        "Accept-Encoding": "gzip, deflate, br, zstd",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
                         "Sec-Fetch-Dest": "document",
                         "Sec-Fetch-Mode": "navigate",
                         "Sec-Fetch-Site": "same-origin" if url_to_visit != "https://www.ozon.ru/" else "none",
-                    })
+                        "Sec-Fetch-User": "?1",
+                        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": '"Windows"',
+                        "DNT": "1",
+                        "Cache-Control": "max-age=0",
+                    }
                     
-                    # Убираем None значения
-                    page_headers = {k: v for k, v in page_headers.items() if v is not None}
+                    # Добавляем Referer для всех страниц кроме главной
+                    if url_to_visit != "https://www.ozon.ru/":
+                        page_headers["Referer"] = "https://www.ozon.ru/"
                     
                     # Добавляем текущие cookies
                     if self._cookies_header:
@@ -326,6 +387,18 @@ class OzonCatalogAPI:
         if self.session:
             await self.session.close()
     
+    def _log_cookies_diagnostic(self):
+        """Диагностическое логирование cookies (Perplexity Fix #4)."""
+        logger.debug("🔍 Детальная диагностика cookies:")
+        logger.debug(f"  • Источник cookies: {'Браузер (auto)' if self.auto_get_cookies else 'Ручные'}")
+        logger.debug(f"  • Количество cookies: {len(self._cookies_dict)}")
+        logger.debug(f"  • Имена cookies: {list(self._cookies_dict.keys())}")
+        logger.debug(f"  • Длина cookies header: {len(self._cookies_header) if self._cookies_header else 0}")
+        
+        # Показываем первые 50 символов каждого cookie для проверки валидности
+        for name, value in list(self._cookies_dict.items())[:5]:  # Первые 5 cookies
+            logger.debug(f"  • {name}: {value[:50]}{'...' if len(value) > 50 else ''}")
+    
     def _build_url(self, seller_id: int, seller_name: str, page: int = 1, 
                    paginator_token: Optional[str] = None,
                    search_page_state: Optional[str] = None) -> str:
@@ -402,12 +475,13 @@ class OzonCatalogAPI:
                 logger.debug(f"  • Cookies: {list(self._cookies_dict.keys())}")
                 logger.debug(f"  • Cookies header: {self._cookies_header[:200] if self._cookies_header else 'НЕТ'}...")
                 
+                # Полный набор заголовков для API запроса с максимальной эмуляцией браузера
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                     "Accept": "application/json, text/plain, */*",
                     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Referer": "https://www.ozon.ru/",
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
+                    "Referer": f"https://www.ozon.ru/seller/{seller_name}-{seller_id}/",  # Более точный Referer - страница продавца
                     "Origin": "https://www.ozon.ru",
                     "Connection": "keep-alive",
                     "Sec-Fetch-Dest": "empty",
@@ -418,6 +492,7 @@ class OzonCatalogAPI:
                     "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
                     "sec-ch-ua-mobile": "?0",
                     "sec-ch-ua-platform": '"Windows"',
+                    "DNT": "1",
                 }
                 
                 # Добавляем cookies если есть
@@ -550,20 +625,28 @@ class OzonCatalogAPI:
                         return None
                         
                 elif response.status_code == 403:
-                    # Forbidden - возможно нужны обновленные cookies
-                    logger.warning(
-                        f"⚠️ Forbidden (403) при запросе страницы {page}. "
-                        f"Попытка обновить cookies через curl_cffi..."
-                    )
+                    # Проверяем наличие ozon-antibot header (Perplexity Fix #2)
+                    response_headers = response.headers if hasattr(response, 'headers') else {}
+                    is_antibot_triggered = 'ozon-antibot' in response_headers or 'ozon-antibot' in str(response_headers).lower()
+                    
+                    if is_antibot_triggered:
+                        self._antibot_triggered_count += 1
+                        logger.error(
+                            f"🚫 Ozon antibot активирован (попытка {retry_count + 1}/{self._antibot_triggered_count} всего)"
+                        )
                     
                     # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ: Анализ 403 ошибки
                     logger.error(f"🔍 ДИАГНОСТИКА 403 ОШИБКИ:")
                     logger.error(f"  • URL запроса: {url}")
                     logger.error(f"  • Retry count: {retry_count}")
+                    logger.error(f"  • Antibot header: {'ДА (ozon-antibot: 1)' if is_antibot_triggered else 'НЕТ'}")
+                    logger.error(f"  • Всего срабатываний антибота: {self._antibot_triggered_count}")
                     logger.error(f"  • Cookies в словаре: {len(self._cookies_dict)}")
                     logger.error(f"  • Cookies names: {list(self._cookies_dict.keys())}")
-                    logger.error(f"  • Cookies header present: {'ДА' if self._cookies_header else 'НЕТ'}")
-                    logger.error(f"  • Cookies header length: {len(self._cookies_header) if self._cookies_header else 0}")
+                    logger.error(f"  • Proxy: {self.proxy if self.proxy else 'НЕ ИСПОЛЬЗУЕТСЯ'}")
+                    
+                    # Диагностическое логирование cookies (Perplexity Fix #4)
+                    self._log_cookies_diagnostic()
                     
                     # Пробуем получить больше информации из ответа
                     try:
@@ -580,12 +663,26 @@ class OzonCatalogAPI:
                     except Exception as e:
                         logger.error(f"  • Не удалось прочитать response body: {e}")
                     
-                    # Пробуем обновить cookies через curl_cffi (ВАРИАНТ 5)
+                    # Обработка antibot блокировки (Perplexity Fix #2)
+                    if is_antibot_triggered and retry_count > 0:
+                        # После повторной попытки антибот все еще активен
+                        raise OzonAntibotException(
+                            f"❌ Ozon antibot заблокировал доступ после {retry_count + 1} попыток. "
+                            f"Всего срабатываний: {self._antibot_triggered_count}. "
+                            f"Рекомендации:\n"
+                            f"  • Сделайте паузу 5-10 минут\n"
+                            f"  • Смените IP адрес (VPN/proxy)\n"
+                            f"  • Уменьшите частоту запросов\n"
+                            f"  • Используйте headless=False для отладки"
+                        )
+                    
+                    # Первая попытка - пробуем обновить cookies
                     if retry_count == 0:
                         logger.debug(f"  • Попытка обновить cookies через повторную инициализацию...")
                         # Повторно инициализируем сессию для получения свежих cookies
                         await self._initialize_session()
-                        await asyncio.sleep(2.0)
+                        # Увеличенная задержка перед повтором (ChatGPT/Grok рекомендации)
+                        await asyncio.sleep(5.0)
                         return await self._fetch_page(seller_id, seller_name, page, 
                                                       paginator_token, search_page_state, 
                                                       retry_count + 1)
@@ -596,7 +693,8 @@ class OzonCatalogAPI:
                             f"URL: {url}\n"
                             f"Cookies в заголовке: {'ДА' if self._cookies_header else 'НЕТ'}\n"
                             f"Cookies count: {len(self._cookies_dict)}\n"
-                            f"Cookies: {list(self._cookies_dict.keys())}"
+                            f"Cookies: {list(self._cookies_dict.keys())}\n"
+                            f"Proxy: {self.proxy if self.proxy else 'НЕ ИСПОЛЬЗУЕТСЯ'}"
                         )
                         return None
                         

@@ -26,9 +26,13 @@ class OzonParser:
     async def parse_seller_catalog(self, seller_id: int, seller_name: str) -> List[Dict]:
         """Парсинг каталога продавца через публичный API и Seller API.
         
+        КРИТИЧНО: Используем публичный entrypoint API как основной источник данных,
+        так как он содержит почти все нужные цены покупателя (цена со скидкой, зачёркнутая цена),
+        которых нет в официальном Seller API.
+        
         Объединяет данные из двух источников:
-        1. Публичный каталог (entrypoint API) - текущие цены покупателя
-        2. Seller API - цены продавца без акций
+        1. Публичный каталог (entrypoint API) - текущие цены покупателя (ОСНОВНОЙ ИСТОЧНИК)
+        2. Seller API - цены продавца без акций (дополнительный источник)
         
         Args:
             seller_id: ID продавца
@@ -48,8 +52,8 @@ class OzonParser:
         
         all_results = []
         
-        # Шаг 1: Получаем товары из публичного каталога
-        logger.info("📦 Шаг 1/2: Получение товаров из публичного каталога...")
+        # Шаг 1: Получаем товары из публичного каталога (ОСНОВНОЙ ИСТОЧНИК)
+        logger.info("📦 Шаг 1/2: Получение товаров из публичного каталога (entrypoint API)...")
         catalog_start = time.time()
         
         async with OzonCatalogAPI(
@@ -69,7 +73,33 @@ class OzonParser:
         
         if not catalog_products:
             logger.warning("⚠️ Не получено товаров из публичного каталога")
-            return []
+            # Пробуем получить хотя бы через Seller API
+            logger.info("📦 Попытка получить товары через Seller API...")
+            async with OzonSellerAPI(self.client_id, self.api_key, 
+                                     request_delay=self.request_delay) as seller_api:
+                seller_items = await seller_api.fetch_product_prices()
+                if seller_items:
+                    logger.info(f"✅ Получено {len(seller_items)} товаров из Seller API")
+                    for item in seller_items:
+                        parsed = OzonSellerAPI.parse_price_item(item)
+                        result = {
+                            "product_id": parsed.get("product_id"),
+                            "offer_id": parsed.get("offer_id"),
+                            "product_name": None,
+                            "cabinet_id": seller_id,
+                            "cabinet_name": cabinet_name,
+                            "price_seller": parsed.get("seller_price"),
+                            "price_old": parsed.get("old_price"),
+                            "price_min": parsed.get("min_price"),
+                            "currency": parsed.get("currency", "RUB"),
+                            "price_current": None,
+                            "price_original": parsed.get("old_price"),
+                            "discount_percent": None,
+                            "source_catalog": None,
+                            "source_seller": "seller_api",
+                        }
+                        all_results.append(result)
+            return all_results
         
         # Создаем маппинг SKU -> данные из каталога
         catalog_by_sku = {}
@@ -83,25 +113,26 @@ class OzonParser:
         
         logger.info(f"📊 Уникальных SKU для запроса в Seller API: {len(product_ids_for_api)}")
         
-        # Шаг 2: Получаем цены продавца через Seller API
+        # Шаг 2: Получаем цены продавца через Seller API (дополнительный источник)
         logger.info("💰 Шаг 2/2: Получение цен продавца через Seller API...")
         seller_api_start = time.time()
         
         seller_prices_by_sku = {}
         
-        async with OzonSellerAPI(self.client_id, self.api_key, 
-                                 request_delay=self.request_delay) as seller_api:
-            # Получаем цены по product_id (SKU)
-            seller_items = await seller_api.fetch_product_prices(
-                product_ids=product_ids_for_api
-            )
-            
-            # Парсим и индексируем по SKU
-            for item in seller_items:
-                parsed = OzonSellerAPI.parse_price_item(item)
-                sku = parsed.get("product_id")
-                if sku:
-                    seller_prices_by_sku[sku] = parsed
+        if product_ids_for_api:
+            async with OzonSellerAPI(self.client_id, self.api_key, 
+                                     request_delay=self.request_delay) as seller_api:
+                # Получаем цены по product_id (SKU)
+                seller_items = await seller_api.fetch_product_prices(
+                    product_ids=product_ids_for_api
+                )
+                
+                # Парсим и индексируем по SKU
+                for item in seller_items:
+                    parsed = OzonSellerAPI.parse_price_item(item)
+                    sku = parsed.get("product_id")
+                    if sku:
+                        seller_prices_by_sku[sku] = parsed
         
         seller_api_time = time.time() - seller_api_start
         
@@ -128,12 +159,12 @@ class OzonParser:
                 "cabinet_id": seller_id,
                 "cabinet_name": cabinet_name,
                 
-                # Цены из публичного каталога (что видит покупатель)
+                # Цены из публичного каталога (что видит покупатель) - ОСНОВНЫЕ ДАННЫЕ
                 "price_current": catalog_data.get("current_price"),  # Цена со скидкой
                 "price_original": catalog_data.get("original_price"),  # Зачёркнутая цена
                 "discount_percent": catalog_data.get("discount_percent"),
                 
-                # Цены из Seller API (цены продавца)
+                # Цены из Seller API (цены продавца) - ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ
                 "price_seller": seller_data.get("seller_price"),  # Цена продавца (без акций)
                 "price_old": seller_data.get("old_price"),  # Зачёркнутая (из API продавца)
                 "price_min": seller_data.get("min_price"),  # Минимальная цена

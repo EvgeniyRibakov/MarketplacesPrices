@@ -548,17 +548,59 @@ class BrowserCookiesExtractor:
                             break
                         time.sleep(1)
                     
-                    time.sleep(5)  # Дополнительная задержка для установки cookies через JS
+                    time.sleep(10)  # Увеличено время для установки cookies через JS (антибот Ozon требует больше времени)
                     
-                    # Прокручиваем страницу продавца
+                    # Прокручиваем страницу продавца несколько раз для имитации поведения пользователя
+                    # Это помогает запустить JavaScript, который устанавливает cookies
                     try:
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/4);")
+                        time.sleep(1)
                         driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
-                        time.sleep(2)
+                        time.sleep(1)
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                        time.sleep(1)
                         driver.execute_script("window.scrollTo(0, document.body.scrollHeight*2/3);")
+                        time.sleep(1)
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                         time.sleep(2)
+                        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                        time.sleep(1)
                         driver.execute_script("window.scrollTo(0, 0);")
                         time.sleep(2)
                     except:
+                        pass
+                    
+                    # Делаем запрос к entrypoint API через JavaScript для получения cookies
+                    # Это имитирует реальный запрос браузера к API и может установить дополнительные cookies
+                    try:
+                        logger.debug(f"Имитация запроса к entrypoint API через JavaScript для получения cookies...")
+                        # Выполняем JavaScript код, который может установить дополнительные cookies
+                        driver.execute_script("""
+                            // Имитируем запрос к entrypoint API через fetch
+                            // Это может установить дополнительные cookies, которые требуются для обхода антибота
+                            try {
+                                fetch('https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=%2Fseller%2Fcosmo-beauty-176640%2F%3Fpage%3D1', {
+                                    method: 'GET',
+                                    credentials: 'include',
+                                    headers: {
+                                        'Accept': 'application/json, text/plain, */*',
+                                        'Referer': 'https://www.ozon.ru/seller/cosmo-beauty-176640/',
+                                        'Origin': 'https://www.ozon.ru'
+                                    }
+                                }).then(function(response) {
+                                    // Cookies могут быть установлены даже при ошибке CORS
+                                    console.log('API request completed, status:', response.status);
+                                }).catch(function(e) {
+                                    // Игнорируем ошибки CORS - нам нужны только cookies
+                                    console.log('API request error (expected):', e.message);
+                                });
+                            } catch(e) {
+                                console.log('Fetch not available:', e.message);
+                            }
+                        """)
+                        time.sleep(5)  # Даем время на установку cookies после запроса
+                    except Exception as e:
+                        logger.debug(f"  • Ошибка при имитации запроса к API: {e}")
                         pass
                 else:
                     # Для других доменов (WB) - обычная логика
@@ -733,8 +775,10 @@ def get_wb_cookies(use_headless: bool = True) -> Optional[str]:
     return None
 
 
-def get_ozon_cookies(use_headless: bool = True) -> Optional[str]:
+def get_ozon_cookies(use_headless: bool = True, playwright_headless: bool = True) -> Optional[str]:
     """Удобная функция для получения cookies Ozon.
+    
+    Сначала пытается использовать Playwright (более надежно), затем fallback на Selenium.
     
     Args:
         use_headless: Использовать headless Chrome если чтение из БД не удалось
@@ -742,6 +786,45 @@ def get_ozon_cookies(use_headless: bool = True) -> Optional[str]:
     Returns:
         Строка с cookies в формате "name1=value1; name2=value2" или None
     """
+    # Сначала пробуем Playwright (более надежно для обхода антиботов)
+    try:
+        import asyncio
+        import sys
+        from pathlib import Path
+        
+        # Добавляем путь к корню проекта для импорта
+        project_root = Path(__file__).parent.parent.parent
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+        
+        from src.utils.playwright_cookies import get_ozon_cookies_playwright
+        
+        logger.info("Попытка получения cookies Ozon через Playwright (с обходом антиботов)...")
+        
+        # Проверяем, есть ли уже запущенный event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Если loop уже запущен, создаем новый в отдельном потоке
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, get_ozon_cookies_playwright(playwright_headless))
+                    cookies_string = future.result(timeout=120)  # Таймаут 2 минуты
+            else:
+                cookies_string = loop.run_until_complete(get_ozon_cookies_playwright(playwright_headless))
+        except RuntimeError:
+            # Нет event loop, создаем новый
+            cookies_string = asyncio.run(get_ozon_cookies_playwright(playwright_headless))
+        
+        if cookies_string:
+            return cookies_string
+    except ImportError:
+        logger.debug("Playwright не установлен, используем fallback на Selenium")
+    except Exception as e:
+        logger.warning(f"Ошибка при получении cookies через Playwright: {e}, используем fallback")
+        logger.debug("Детали ошибки:", exc_info=True)
+    
+    # Fallback на Selenium (старый способ)
     extractor = BrowserCookiesExtractor()
     cookies = extractor.get_cookies(domain="ozon.ru", use_headless=use_headless)
     
