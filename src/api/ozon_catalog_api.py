@@ -399,6 +399,108 @@ class OzonCatalogAPI:
         for name, value in list(self._cookies_dict.items())[:5]:  # Первые 5 cookies
             logger.debug(f"  • {name}: {value[:50]}{'...' if len(value) > 50 else ''}")
     
+    async def _fetch_page_via_playwright(self, url: str, seller_name: str, seller_id: int) -> Optional[Dict]:
+        """Выполняет запрос к entrypoint API через Playwright (fallback при блокировке curl_cffi).
+        
+        Args:
+            url: URL для запроса к entrypoint API
+            seller_name: Имя продавца (для Referer)
+            seller_id: ID продавца
+            
+        Returns:
+            JSON данные ответа или None при ошибке
+        """
+        try:
+            from playwright.async_api import async_playwright
+            from playwright_stealth import stealth
+            
+            logger.info("🎭 Fallback: Выполняем запрос через Playwright (curl_cffi заблокирован)...")
+            if self.proxy:
+                logger.info(f"  • Используется прокси: {self.proxy}")
+            else:
+                logger.info(f"  • Прокси: НЕ ИСПОЛЬЗУЕТСЯ")
+            
+            async with async_playwright() as p:
+                # Настройка прокси для Playwright (если указан)
+                launch_options = {
+                    'headless': True,
+                    'args': [
+                        '--no-sandbox',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                    ]
+                }
+                
+                browser = await p.chromium.launch(**launch_options)
+                
+                # Настройка прокси для контекста браузера
+                context_options = {
+                    'viewport': {'width': 1920, 'height': 1080},
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'locale': 'ru-RU',
+                    'timezone_id': 'Europe/Moscow',
+                }
+                
+                # Добавляем прокси, если указан
+                if self.proxy:
+                    # Парсим прокси формат: http://host:port или socks5://host:port
+                    if self.proxy.startswith('http://') or self.proxy.startswith('https://'):
+                        context_options['proxy'] = {'server': self.proxy}
+                    elif self.proxy.startswith('socks5://'):
+                        context_options['proxy'] = {'server': self.proxy}
+                    else:
+                        # Если формат не указан, предполагаем http://
+                        context_options['proxy'] = {'server': f'http://{self.proxy}'}
+                    logger.debug(f"  • Playwright использует прокси: {context_options['proxy']}")
+                
+                context = await browser.new_context(**context_options)
+                
+                page = await context.new_page()
+                
+                # Применяем stealth (если доступен)
+                try:
+                    if callable(stealth):
+                        stealth(page)
+                except:
+                    pass
+                
+                # Сначала открываем страницу продавца для установки cookies
+                seller_page_url = f"https://www.ozon.ru/seller/{seller_name}-{seller_id}/"
+                await page.goto(seller_page_url, wait_until='networkidle', timeout=30000)
+                await asyncio.sleep(2)
+                
+                # Теперь делаем запрос к API через Playwright
+                headers = {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': seller_page_url,
+                    'Origin': 'https://www.ozon.ru'
+                }
+                
+                response = await page.request.get(url, headers=headers)
+                
+                if response.status == 200:
+                    try:
+                        data = await response.json()
+                        await browser.close()
+                        logger.success(f"✅ Playwright fallback успешен: получен JSON ответ")
+                        return data
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка парсинга JSON из Playwright ответа: {e}")
+                        await browser.close()
+                        return None
+                else:
+                    logger.warning(f"⚠️ Playwright fallback вернул статус {response.status}")
+                    await browser.close()
+                    return None
+                    
+        except ImportError:
+            logger.warning("⚠️ Playwright не установлен, fallback недоступен")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка при Playwright fallback: {e}")
+            logger.debug("Детали ошибки:", exc_info=True)
+            return None
+    
     def _build_url(self, seller_id: int, seller_name: str, page: int = 1, 
                    paginator_token: Optional[str] = None,
                    search_page_state: Optional[str] = None) -> str:
@@ -676,18 +778,24 @@ class OzonCatalogAPI:
                             f"  • Используйте headless=False для отладки"
                         )
                     
-                    # Первая попытка - пробуем обновить cookies
+                    # Первая попытка - пробуем fallback на Playwright (так как curl_cffi детектируется)
                     if retry_count == 0:
-                        logger.debug(f"  • Попытка обновить cookies через повторную инициализацию...")
-                        # Повторно инициализируем сессию для получения свежих cookies
+                        logger.warning(f"  • curl_cffi заблокирован антиботом, пробуем через Playwright...")
+                        # Используем Playwright для выполнения запроса (он успешно проходит антибот)
+                        playwright_result = await self._fetch_page_via_playwright(url, seller_name, seller_id)
+                        if playwright_result:
+                            logger.success(f"✅ Успешно получена страница {page} через Playwright (fallback)")
+                            return playwright_result
+                        
+                        # Если Playwright тоже не помог, пробуем обновить cookies
+                        logger.debug(f"  • Playwright fallback не помог, пробуем обновить cookies...")
                         await self._initialize_session()
-                        # Увеличенная задержка перед повтором (ChatGPT/Grok рекомендации)
                         await asyncio.sleep(5.0)
                         return await self._fetch_page(seller_id, seller_name, page, 
                                                       paginator_token, search_page_state, 
                                                       retry_count + 1)
                     else:
-                        # Логируем финальные детали для диагностики
+                        # После второй попытки все еще 403 - выбрасываем исключение
                         logger.error(
                             f"❌ Forbidden (403) при запросе страницы {page} (после retry):\n"
                             f"URL: {url}\n"
