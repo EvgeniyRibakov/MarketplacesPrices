@@ -897,48 +897,284 @@ class OzonCatalogAPI:
         successful_pages += 1
         
         # Извлекаем параметры для следующей страницы
+        # Пробуем разные варианты полей для пагинации
         next_page_url = first_page_data.get("nextPage")
+        pagination_info = None
+        
+        # ДИАГНОСТИКА: Проверяем структуру ответа для пагинации
+        logger.debug(f"🔍 ДИАГНОСТИКА пагинации (страница 1):")
+        logger.debug(f"  • Ключи в ответе: {list(first_page_data.keys())[:10]}")
+        logger.debug(f"  • nextPage присутствует: {'ДА' if next_page_url else 'НЕТ'}")
+        
+        # Ищем пагинацию в widgetStates (tileGridDesktop)
+        widget_states = first_page_data.get("widgetStates", {})
+        for state_id, state_json in widget_states.items():
+            if "tileGridDesktop" in state_id:
+                try:
+                    import json
+                    try:
+                        state_data = json.loads(state_json)
+                    except:
+                        state_data = state_json
+                    
+                    # Ищем поля пагинации в state_data
+                    logger.debug(f"  • Проверяем tileGridDesktop для пагинации...")
+                    logger.debug(f"  • Ключи в state_data: {list(state_data.keys())[:15]}")
+                    
+                    # Проверяем количество товаров на странице
+                    items_count = len(state_data.get("items", []))
+                    current_page = state_data.get("page", 1)
+                    logger.debug(f"  • Товаров на странице: {items_count}, текущая страница: {current_page}")
+                    
+                    # Проверяем sharedData (может содержать информацию о пагинации)
+                    shared_data = state_data.get("sharedData", {})
+                    if shared_data:
+                        logger.debug(f"  • Найдено sharedData, ключи: {list(shared_data.keys())[:10]}")
+                        if "pagination" in shared_data:
+                            pagination_info = shared_data.get("pagination")
+                            logger.debug(f"  • ✅ Найдено 'pagination' в sharedData")
+                        if "nextPage" in shared_data:
+                            next_page_url = shared_data.get("nextPage")
+                            logger.debug(f"  • ✅ Найдено 'nextPage' в sharedData")
+                        if "paginatorToken" in shared_data:
+                            paginator_token = shared_data.get("paginatorToken")
+                            logger.debug(f"  • ✅ Найдено 'paginatorToken' в sharedData: {paginator_token[:50] if paginator_token else None}")
+                        if "searchPageState" in shared_data:
+                            search_page_state = shared_data.get("searchPageState")
+                            logger.debug(f"  • ✅ Найдено 'searchPageState' в sharedData")
+                    
+                    # Проверяем различные варианты полей пагинации в state_data
+                    if "nextPage" in state_data:
+                        next_page_url = state_data.get("nextPage")
+                        logger.debug(f"  • ✅ Найдено nextPage в tileGridDesktop: {next_page_url[:200] if next_page_url else None}")
+                    if "next" in state_data:
+                        next_val = state_data.get("next")
+                        logger.debug(f"  • ✅ Найдено 'next' в tileGridDesktop: {type(next_val)}")
+                        if isinstance(next_val, str) and next_val:
+                            next_page_url = next_val
+                        elif isinstance(next_val, dict):
+                            pagination_info = next_val
+                    if "pagination" in state_data:
+                        pagination_info = state_data.get("pagination")
+                        logger.debug(f"  • ✅ Найдено 'pagination' в tileGridDesktop: {type(pagination_info)}")
+                    if "hasNext" in state_data:
+                        has_next = state_data.get("hasNext")
+                        logger.debug(f"  • ✅ Найдено 'hasNext' в tileGridDesktop: {has_next}")
+                        if has_next:
+                            # Если hasNext=True, но нет токенов, пробуем следующую страницу с инкрементом
+                            if not current_paginator_token and not current_search_page_state:
+                                logger.debug(f"  • hasNext=True, но нет токенов - будем пробовать следующую страницу")
+                    if "paginatorToken" in state_data:
+                        paginator_token = state_data.get("paginatorToken")
+                        logger.debug(f"  • ✅ Найдено 'paginatorToken' в tileGridDesktop: {paginator_token[:50] if paginator_token else None}")
+                    if "searchPageState" in state_data:
+                        search_page_state = state_data.get("searchPageState")
+                        logger.debug(f"  • ✅ Найдено 'searchPageState' в tileGridDesktop")
+                    
+                    # Если получили 12 товаров (типичная полная страница), возможно есть следующая
+                    # Но это не надёжный индикатор, поэтому используем только если есть явные признаки
+                except Exception as e:
+                    logger.debug(f"  • Ошибка при проверке tileGridDesktop: {e}")
+        
+        # Если не нашли в widgetStates, проверяем корневой уровень
+        if not next_page_url:
+            # Проверяем pageInfo (может содержать информацию о пагинации)
+            page_info = first_page_data.get("pageInfo", {})
+            if page_info:
+                logger.debug(f"  • Найдено pageInfo, ключи: {list(page_info.keys())[:10]}")
+                if "nextPage" in page_info:
+                    next_page_url = page_info.get("nextPage")
+                    logger.debug(f"  • ✅ Найдено 'nextPage' в pageInfo")
+                if "pagination" in page_info:
+                    pagination_info = page_info.get("pagination")
+                    logger.debug(f"  • ✅ Найдено 'pagination' в pageInfo")
+            
+            if "next" in first_page_data:
+                next_val = first_page_data.get("next")
+                logger.debug(f"  • ✅ Найдено 'next' в корневом уровне: {type(next_val)}")
+                if isinstance(next_val, str) and next_val:
+                    next_page_url = next_val
+                elif isinstance(next_val, dict):
+                    pagination_info = next_val
+            if "pagination" in first_page_data:
+                pagination_info = first_page_data.get("pagination")
+                logger.debug(f"  • ✅ Найдено 'pagination' в корневом уровне")
+        
+        # Если всё ещё нет информации о пагинации, но получили 12 товаров (полная страница),
+        # пробуем следующую страницу с инкрементом page (на основе данных из F12)
+        # Это эвристика: если получили полную страницу, вероятно есть следующая
+        if not next_page_url and not pagination_info and len(products) == 12:
+            logger.debug(f"  • ⚠️ Пагинация не найдена, но получено 12 товаров (полная страница)")
+            logger.debug(f"  • Пробуем следующую страницу с инкрементом page (page=2)")
+            # Устанавливаем флаг для попытки следующей страницы
+            # В цикле будем пробовать page=2 без токенов (Ozon может принять такой запрос)
+            current_paginator_token = None  # Будем пробовать без токенов для page=2
+            current_search_page_state = None
+        
+        if next_page_url:
+            logger.debug(f"  • ✅ Используем nextPage URL: {next_page_url[:200]}")
+        elif pagination_info:
+            logger.debug(f"  • ✅ Используем pagination info: {pagination_info}")
+        else:
+            logger.debug(f"  • ⚠️ Пагинация не найдена - возможно, это последняя страница или у продавца только одна страница")
         
         logger.info(
             f"✅ Страница 1: получено {len(products)} товаров "
             f"(время: {first_page_time:.2f} сек)"
         )
         
-        # Если есть nextPage, продолжаем загрузку
-        while next_page_url and page < max_pages:
-            page += 1
-            
-            # Извлекаем параметры из nextPage URL
+        # Если есть nextPage или pagination_info, продолжаем загрузку
+        current_paginator_token = None
+        current_search_page_state = None
+        
+        # Извлекаем параметры из pagination_info, если есть
+        if pagination_info and isinstance(pagination_info, dict):
+            current_paginator_token = pagination_info.get("paginatorToken") or pagination_info.get("paginator_token")
+            current_search_page_state = pagination_info.get("searchPageState") or pagination_info.get("search_page_state")
+        
+        # Если есть nextPage URL, извлекаем параметры из него
+        if next_page_url:
             try:
                 from urllib.parse import urlparse, parse_qs
                 parsed = urlparse(next_page_url)
                 params = parse_qs(parsed.query)
                 
-                paginator_token = params.get('paginator_token', [None])[0]
-                search_page_state = params.get('search_page_state', [None])[0]
+                if not current_paginator_token:
+                    current_paginator_token = params.get('paginator_token', [None])[0]
+                if not current_search_page_state:
+                    current_search_page_state = params.get('search_page_state', [None])[0]
+            except Exception as e:
+                logger.debug(f"  • Ошибка при парсинге nextPage URL: {e}")
+        
+        # Флаг для эвристической пагинации (если получили полную страницу, но нет токенов)
+        try_next_page_heuristic = (not next_page_url and not current_paginator_token and 
+                                   not current_search_page_state and len(products) == 12)
+        
+        # Продолжаем загрузку, если есть информация о следующей странице или эвристика
+        while ((next_page_url or current_paginator_token or current_search_page_state or try_next_page_heuristic) 
+               and page < max_pages):
+            page += 1
+            
+            try:
+                logger.info(f"📄 Загрузка страницы {page}...")
                 
                 page_data = await self._fetch_page(
                     seller_id, seller_name, page, 
-                    paginator_token, search_page_state
+                    current_paginator_token, current_search_page_state
                 )
                 
                 if not page_data:
                     failed_pages += 1
+                    logger.warning(f"⚠️ Не удалось загрузить страницу {page}")
                     break
                 
                 products = self.parse_products_from_page(page_data)
                 all_products.extend(products)
                 successful_pages += 1
                 
-                # Проверяем наличие следующей страницы
-                next_page_url = page_data.get("nextPage")
+                logger.info(
+                    f"✅ Страница {page}: получено {len(products)} товаров. "
+                    f"Всего собрано: {len(all_products)}"
+                )
                 
                 if not products:
                     # Если товаров нет, прекращаем
+                    logger.info(f"ℹ️ Страница {page} пустая, прекращаем загрузку")
+                    break
+                
+                # Ищем информацию о следующей странице в ответе
+                next_page_url = None
+                pagination_info = None
+                
+                # Ищем в widgetStates (tileGridDesktop)
+                widget_states = page_data.get("widgetStates", {})
+                for state_id, state_json in widget_states.items():
+                    if "tileGridDesktop" in state_id:
+                        try:
+                            import json
+                            try:
+                                state_data = json.loads(state_json)
+                            except:
+                                state_data = state_json
+                            
+                            # Проверяем sharedData
+                            shared_data = state_data.get("sharedData", {})
+                            if shared_data:
+                                if "paginatorToken" in shared_data:
+                                    current_paginator_token = shared_data.get("paginatorToken")
+                                    logger.debug(f"  • Извлечён paginatorToken из sharedData: {current_paginator_token[:50] if current_paginator_token else None}")
+                                if "searchPageState" in shared_data:
+                                    current_search_page_state = shared_data.get("searchPageState")
+                                    logger.debug(f"  • Извлечён searchPageState из sharedData")
+                                if "pagination" in shared_data:
+                                    pagination_info = shared_data.get("pagination")
+                                if "nextPage" in shared_data:
+                                    next_page_url = shared_data.get("nextPage")
+                            
+                            if "nextPage" in state_data:
+                                next_page_url = state_data.get("nextPage")
+                            elif "next" in state_data:
+                                next_val = state_data.get("next")
+                                if isinstance(next_val, str) and next_val:
+                                    next_page_url = next_val
+                                elif isinstance(next_val, dict):
+                                    pagination_info = next_val
+                            if "pagination" in state_data:
+                                pagination_info = state_data.get("pagination")
+                            if "paginatorToken" in state_data:
+                                current_paginator_token = state_data.get("paginatorToken")
+                                logger.debug(f"  • Извлечён paginatorToken из state_data: {current_paginator_token[:50] if current_paginator_token else None}")
+                            if "searchPageState" in state_data:
+                                current_search_page_state = state_data.get("searchPageState")
+                                logger.debug(f"  • Извлечён searchPageState из state_data")
+                        except Exception as e:
+                            logger.debug(f"Ошибка при проверке пагинации: {e}")
+                
+                # Если не нашли в widgetStates, проверяем корневой уровень
+                if not next_page_url:
+                    # Проверяем pageInfo
+                    page_info = page_data.get("pageInfo", {})
+                    if page_info:
+                        if "nextPage" in page_info:
+                            next_page_url = page_info.get("nextPage")
+                            logger.debug(f"  • Найдено 'nextPage' в pageInfo страницы {page}")
+                        if "pagination" in page_info:
+                            pagination_info = page_info.get("pagination")
+                            logger.debug(f"  • Найдено 'pagination' в pageInfo страницы {page}")
+                    
+                    if "nextPage" in page_data:
+                        next_page_url = page_data.get("nextPage")
+                    elif "next" in page_data:
+                        next_val = page_data.get("next")
+                        if isinstance(next_val, str) and next_val:
+                            next_page_url = next_val
+                        elif isinstance(next_val, dict):
+                            pagination_info = next_val
+                    if "pagination" in page_data:
+                        pagination_info = page_data.get("pagination")
+                
+                # Обновляем параметры пагинации из pagination_info
+                if pagination_info and isinstance(pagination_info, dict):
+                    current_paginator_token = pagination_info.get("paginatorToken") or pagination_info.get("paginator_token") or current_paginator_token
+                    current_search_page_state = pagination_info.get("searchPageState") or pagination_info.get("search_page_state") or current_search_page_state
+                
+                # Обновляем флаг эвристической пагинации
+                try_next_page_heuristic = (not next_page_url and not current_paginator_token and 
+                                           not current_search_page_state and len(products) == 12)
+                
+                # Если нет информации о следующей странице и не используем эвристику, прекращаем
+                if not next_page_url and not current_paginator_token and not current_search_page_state and not try_next_page_heuristic:
+                    logger.info(f"ℹ️ Информация о следующей странице не найдена, прекращаем загрузку")
+                    break
+                
+                # Если используем эвристику и получили меньше 12 товаров, прекращаем
+                if try_next_page_heuristic and len(products) < 12:
+                    logger.info(f"ℹ️ Получено меньше 12 товаров ({len(products)}), прекращаем эвристическую пагинацию")
                     break
                     
             except Exception as e:
                 logger.error(f"❌ Ошибка при обработке страницы {page}: {e}")
+                logger.debug("Детали ошибки:", exc_info=True)
                 failed_pages += 1
                 break
         
