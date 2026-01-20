@@ -1,22 +1,22 @@
 {
   "epilprofi": {
-    "url": "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=138499&curr=rub&dest=-3115289&hide_dtype=9&hide_vflags=4294967296&lang=ru&page=1&sort=popular&spp=30",
+    "url": "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=138499&curr=rub&dest=-1257786&hide_dtype=9&hide_vflags=4294967296&lang=ru&page=1&sort=popular&spp=30",
     "brand_id": "138499",
-    "dest": "-3115289",
+    "dest": "-1257786",
     "spp": "30",
     "fsupplier": null
   },
   "lavant": {
-    "url": "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=75848&curr=rub&dest=-3115289&hide_dtype=9&hide_vflags=4294967296&lang=ru&page=1&sort=popular&spp=30",
+    "url": "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=75848&curr=rub&dest=-1257786&hide_dtype=9&hide_vflags=4294967296&lang=ru&page=1&sort=popular&spp=30",
     "brand_id": "75848",
-    "dest": "-3115289",
+    "dest": "-1257786",
     "spp": "30",
     "fsupplier": null
   },
   "likato": {
-    "url": "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=68941&curr=rub&dest=-3115289&hide_dtype=9&hide_vflags=4294967296&lang=ru&page=1&sort=popular&spp=30",
+    "url": "https://www.wildberries.ru/__internal/u-catalog/brands/v4/catalog?ab_testing=false&appType=1&brand=68941&curr=rub&dest=-1257786&hide_dtype=9&hide_vflags=4294967296&lang=ru&page=1&sort=popular&spp=30",
     "brand_id": "68941",
-    "dest": "-3115289",
+    "dest": "-1257786",
     "spp": "30",
     "fsupplier": null
   }

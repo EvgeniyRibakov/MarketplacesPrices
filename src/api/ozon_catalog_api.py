@@ -1,5 +1,6 @@
 """Модуль для работы с публичным API каталога продавца Ozon (entrypoint)."""
 import asyncio
+import os
 import re
 import time
 from typing import List, Dict, Optional
@@ -8,6 +9,18 @@ from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import DNSError, RequestException
 from loguru import logger
 from src.exceptions import OzonAntibotException
+
+
+def get_playwright_headless() -> bool:
+    """Получает настройку headless режима Playwright из переменной окружения.
+    
+    Читает переменную каждый раз при вызове, чтобы учитывать изменения в .env файле.
+    
+    Returns:
+        True если headless режим включен, False если выключен
+    """
+    headless_str = os.getenv('OZON_PLAYWRIGHT_HEADLESS', 'true').lower().strip()
+    return headless_str in ('true', '1', 'yes')
 
 
 class OzonCatalogAPI:
@@ -422,9 +435,13 @@ class OzonCatalogAPI:
                 logger.info(f"  • Прокси: НЕ ИСПОЛЬЗУЕТСЯ")
             
             async with async_playwright() as p:
+                # Получаем настройку headless режима из переменной окружения
+                headless_mode = get_playwright_headless()
+                logger.debug(f"  • Headless режим Playwright: {headless_mode} (из OZON_PLAYWRIGHT_HEADLESS={os.getenv('OZON_PLAYWRIGHT_HEADLESS', 'true')})")
+                
                 # Настройка прокси для Playwright (если указан)
                 launch_options = {
-                    'headless': True,
+                    'headless': headless_mode,
                     'args': [
                         '--no-sandbox',
                         '--disable-blink-features=AutomationControlled',
@@ -456,7 +473,15 @@ class OzonCatalogAPI:
                 
                 context = await browser.new_context(**context_options)
                 
-                page = await context.new_page()
+                # Получаем список всех страниц (вкладок) в контексте
+                pages = context.pages
+                
+                # Если есть уже открытые страницы, используем первую (она успела загрузиться)
+                if pages:
+                    page = pages[0]
+                    logger.debug(f"  • Используем первую открытую страницу (всего открыто: {len(pages)})")
+                else:
+                    page = await context.new_page()
                 
                 # Применяем stealth (если доступен)
                 try:
@@ -467,8 +492,35 @@ class OzonCatalogAPI:
                 
                 # Сначала открываем страницу продавца для установки cookies
                 seller_page_url = f"https://www.ozon.ru/seller/{seller_name}-{seller_id}/"
-                await page.goto(seller_page_url, wait_until='networkidle', timeout=30000)
-                await asyncio.sleep(2)
+                
+                # Ждем полной загрузки страницы с проверкой готовности
+                logger.debug(f"  • Открываем страницу продавца: {seller_page_url}")
+                await page.goto(seller_page_url, wait_until='networkidle', timeout=60000)
+                
+                # Дополнительная проверка загрузки: ждем появления элементов или скриптов
+                try:
+                    # Ждем загрузки основного контента (проверяем наличие элементов каталога)
+                    await page.wait_for_load_state('domcontentloaded', timeout=10000)
+                    await page.wait_for_load_state('networkidle', timeout=10000)
+                    
+                    # Небольшая задержка для завершения всех асинхронных запросов
+                    await asyncio.sleep(1)
+                    
+                    # Проверяем, что страница действительно загрузилась
+                    page_ready = await page.evaluate('''() => {
+                        return document.readyState === 'complete' && 
+                               (window.jQuery === undefined || window.jQuery.active === 0);
+                    }''')
+                    
+                    if not page_ready:
+                        logger.debug(f"  • Страница еще загружается, ждем дополнительно...")
+                        await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.debug(f"  • Предупреждение при проверке загрузки: {e}")
+                    # Продолжаем даже если проверка не прошла
+                
+                logger.debug(f"  • Страница продавца загружена, делаем запрос к API")
                 
                 # Теперь делаем запрос к API через Playwright
                 headers = {
@@ -1224,8 +1276,18 @@ class OzonCatalogAPI:
                         product = OzonCatalogAPI.parse_product(item)
                         if product:
                             products.append(product)
+                            # Краткое логирование по каждому товару
+                            sku = product.get('sku', 'N/A')
+                            price = product.get('current_price', 'N/A')
+                            old_price = product.get('original_price', 'N/A')
+                            discount = product.get('discount_percent', 'N/A')
+                            logger.debug(f"  ✓ SKU {sku}: цена={price}, старая={old_price}, скидка={discount}%")
+                        else:
+                            sku = item.get('sku', 'N/A')
+                            logger.debug(f"  ✗ SKU {sku}: товар не распарсен")
                     except Exception as e:
-                        logger.debug(f"Ошибка при парсинге товара: {e}")
+                        sku = item.get('sku', 'N/A') if isinstance(item, dict) else 'N/A'
+                        logger.debug(f"  ✗ SKU {sku}: ошибка парсинга - {e}")
                         continue
         
         except Exception as e:
@@ -1387,15 +1449,16 @@ class OzonCatalogAPI:
                         except:
                             pass
             
-            # Логируем товары без цен для диагностики
+            # Логируем товары без цен для диагностики (кратко)
             if current_price is None:
-                logger.debug(f"⚠️ Товар SKU {sku} не имеет цены покупателя. mainState типы: {[s.get('type') for s in main_state]}")
+                state_types = [s.get('type') for s in main_state]
+                logger.debug(f"  ⚠️ SKU {sku}: нет цены покупателя, типы states: {state_types}")
             
             if original_price is None and current_price is not None:
                 # Если есть текущая цена, но нет зачёркнутой - это нормально (нет скидки)
                 pass
             elif original_price is None and current_price is None:
-                logger.debug(f"⚠️ Товар SKU {sku} не имеет ни одной цены")
+                logger.debug(f"  ⚠️ SKU {sku}: нет ни одной цены")
             
             return {
                 "sku": sku,

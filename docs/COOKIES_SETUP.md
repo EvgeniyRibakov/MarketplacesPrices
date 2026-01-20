@@ -70,7 +70,7 @@ WB_COOKIE__WBAUID=ваше_значение_здесь
 ## Пример заполненного .env
 
 ```env
-WB_DEST=-3115289
+WB_DEST=-1257786
 WB_SPP=30
 
 WB_COOKIE_WBX_VALIDATION_KEY=abc123def456

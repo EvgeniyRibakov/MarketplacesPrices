@@ -67,7 +67,7 @@ def load_env_config() -> Dict:
                 discounts_tokens_by_cabinet[cabinet_name] = token
         
         return {
-            "dest": int(os.getenv("WB_DEST", "-3115289")),
+            "dest": int(os.getenv("WB_DEST", "-1257786")),  # ПВЗ: г Москва, ул Никольская д. 7-9, стр. 4
             "spp": int(os.getenv("WB_SPP", "30")),
             "cookies": cookies_string,
             "discounts_api_token": discounts_api_token,
@@ -75,7 +75,7 @@ def load_env_config() -> Dict:
         }
     except Exception:
         return {
-            "dest": -3115289, 
+            "dest": -1257786,  # ПВЗ: г Москва, ул Никольская д. 7-9, стр. 4
             "spp": 30, 
             "cookies": None, 
             "discounts_api_token": None,
