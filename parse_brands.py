@@ -39,7 +39,18 @@ def load_env_config() -> Dict:
         if env_file.exists():
             load_dotenv(env_file)
         
-        # Собираем cookies из .env
+        discounts_api_token = os.getenv("WB_DISCOUNTS_API_TOKEN")
+        
+        # Загружаем токены для каждого кабинета (если указаны)
+        discounts_tokens_by_cabinet = {}
+        cabinet_names = ["COSMO", "BEAUTYLAB", "MAU", "MAB", "MMA", "DREAMLAB"]
+        for cabinet_name in cabinet_names:
+            token = os.getenv(f"WB_DISCOUNTS_API_TOKEN_{cabinet_name}")
+            if token:
+                discounts_tokens_by_cabinet[cabinet_name] = token
+        
+        # Собираем cookies из .env (опционально, для обхода антибота)
+        # Если cookies не указаны, код попытается работать без них (может не работать)
         cookies_parts = []
         cookie_names = [
             "wbx-validation-key",
@@ -56,42 +67,34 @@ def load_env_config() -> Dict:
         
         cookies_string = "; ".join(cookies_parts) if cookies_parts else None
         
-        discounts_api_token = os.getenv("WB_DISCOUNTS_API_TOKEN")
-        
-        # Загружаем токены для каждого кабинета (если указаны)
-        discounts_tokens_by_cabinet = {}
-        cabinet_names = ["COSMO", "BEAUTYLAB", "MAU", "MAB", "MMA", "DREAMLAB"]
-        for cabinet_name in cabinet_names:
-            token = os.getenv(f"WB_DISCOUNTS_API_TOKEN_{cabinet_name}")
-            if token:
-                discounts_tokens_by_cabinet[cabinet_name] = token
-        
         return {
             "dest": int(os.getenv("WB_DEST", "-1257786")),  # ПВЗ: г Москва, ул Никольская д. 7-9, стр. 4
             "spp": int(os.getenv("WB_SPP", "30")),
-            "cookies": cookies_string,
+            "cookies": cookies_string,  # Опционально: cookies из .env для обхода антибота
             "discounts_api_token": discounts_api_token,
             "discounts_tokens_by_cabinet": discounts_tokens_by_cabinet,
         }
     except Exception:
         return {
             "dest": -1257786,  # ПВЗ: г Москва, ул Никольская д. 7-9, стр. 4
-            "spp": 30, 
-            "cookies": None, 
+            "spp": 30,
+            "cookies": None,  # Cookies опциональны
             "discounts_api_token": None,
             "discounts_tokens_by_cabinet": {}
         }
 
 
-async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Optional[str] = None, 
+async def fetch_discounted_prices_for_results(results: List[Dict], 
+                                             cookies: Optional[str] = None,
                                              discounts_api_token: Optional[str] = None,
                                              discounts_tokens_by_cabinet: Optional[Dict[str, str]] = None) -> List[Dict]:
     """Получает discountedPrice для всех товаров из результатов парсинга.
     
     Args:
         results: Список результатов парсинга с полем product_id
-        cookies: Cookies из .env для запросов
+        cookies: Опциональные cookies для запросов (если нужны для discounts API)
         discounts_api_token: Токен для авторизации в discounts API
+        discounts_tokens_by_cabinet: Токены по кабинетам для discounts API
     
     Returns:
         Обновленный список результатов с полем price_before_spp
@@ -180,7 +183,7 @@ async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Opti
             
             async with WBCatalogAPI(
                 request_delay=0.1, 
-                max_concurrent=10, 
+                max_concurrent=10,
                 cookies=cookies,
                 discounts_api_token=cabinet_token
             ) as api:
@@ -192,7 +195,7 @@ async def fetch_discounted_prices_for_results(results: List[Dict], cookies: Opti
         # Используем общий токен для всех товаров
         async with WBCatalogAPI(
             request_delay=0.1, 
-            max_concurrent=10, 
+            max_concurrent=10,
             cookies=cookies,
             discounts_api_token=discounts_api_token
         ) as api:
@@ -367,7 +370,13 @@ async def parse_all_sellers():
     if cookies:
         logger.info("✅ Используются cookies из .env файла")
     else:
-        logger.warning("⚠️ Cookies не найдены в .env - запросы могут быть заблокированы антиботом")
+        logger.warning("⚠️ Cookies не найдены в .env - запросы могут быть заблокированы антиботом (ошибка 498)")
+        logger.info("💡 Для работы парсера необходимо указать cookies в .env файле:")
+        logger.info("   WB_COOKIE_WBX_VALIDATION_KEY=...")
+        logger.info("   WB_COOKIE__CP=...")
+        logger.info("   WB_COOKIE_ROUTEB=...")
+        logger.info("   WB_COOKIE_X_WBAAS_TOKEN=...")
+        logger.info("   WB_COOKIE__WBAUID=...")
     
     successful_suppliers = 0
     failed_suppliers = 0
@@ -417,7 +426,7 @@ async def parse_all_sellers():
         discounts_api_token = env_config.get("discounts_api_token")
         discounts_tokens_by_cabinet = env_config.get("discounts_tokens_by_cabinet", {})
         all_results = await fetch_discounted_prices_for_results(
-            all_results, 
+            all_results,
             cookies=cookies,
             discounts_api_token=discounts_api_token,
             discounts_tokens_by_cabinet=discounts_tokens_by_cabinet

@@ -205,7 +205,8 @@ class WildberriesParser:
             supplier_id: ID продавца (supplier_id)
             dest: ID региона/ПВЗ
             spp: Параметр spp (обычно 30)
-            cookies: Cookies из браузера в формате "name1=value1; name2=value2"
+            cookies: Опциональные cookies в формате "name1=value1; name2=value2" 
+                    (необязательно, но рекомендуется для обхода антибота)
         
         Returns:
             Список товаров с ценами из каталога продавца

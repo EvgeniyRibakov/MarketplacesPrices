@@ -23,21 +23,20 @@ class WBCatalogAPI:
     }
     
     def __init__(self, request_delay: float = 0.1, max_concurrent: int = 5, cookies: Optional[str] = None, 
-                 auto_get_cookies: bool = True, discounts_api_token: Optional[str] = None):
+                 discounts_api_token: Optional[str] = None):
         """Инициализация клиента.
         
         Args:
             request_delay: Задержка между запросами (секунды)
             max_concurrent: Максимальное количество параллельных запросов
-            cookies: Опциональные cookies из браузера в формате "name1=value1; name2=value2"
-            auto_get_cookies: Автоматически получать cookies из браузера если не переданы
+            cookies: Опциональные cookies в формате "name1=value1; name2=value2" (необязательно, 
+                    curl_cffi автоматически управляет cookies через сессию)
             discounts_api_token: Токен для авторизации в discounts-prices-api.wildberries.ru
         """
         self.request_delay = request_delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[AsyncSession] = None
         self.custom_cookies = cookies
-        self.auto_get_cookies = auto_get_cookies
         self._cookies_header: Optional[str] = None
         self._cookies_dict: Dict[str, str] = {}  # Кэш cookies для быстрого доступа
         self.discounts_api_token = discounts_api_token
@@ -46,88 +45,28 @@ class WBCatalogAPI:
         """Асинхронный контекстный менеджер - вход."""
         # Создаем сессию curl_cffi с эмуляцией Chrome 131
         # impersonate эмулирует TLS fingerprint браузера
+        # curl_cffi автоматически управляет cookies через сессию
         self.session = AsyncSession(
             impersonate="chrome131",  # Эмулирует Chrome 131 TLS fingerprint
             timeout=30,
         )
         
-        # Если переданы cookies из браузера, добавляем их
+        # Если переданы cookies, добавляем их в сессию
         if self.custom_cookies:
             await self._load_custom_cookies()
-        elif self.auto_get_cookies:
-            # Пробуем автоматически получить cookies из браузера
-            await self._load_cookies_from_browser()
         
-        # Получаем cookies с главной страницы перед API запросами
+        # Инициализируем сессию (получаем cookies через запросы к WB)
         await self._initialize_session()
         
         return self
     
-    async def _load_cookies_from_browser(self):
-        """Автоматически загружает cookies из браузера Chrome."""
-        try:
-            # Импортируем в функции, чтобы не было проблем если библиотека не установлена
-            import sys
-            from pathlib import Path
-            # Добавляем путь к корню проекта для импорта
-            project_root = Path(__file__).parent.parent.parent
-            if str(project_root) not in sys.path:
-                sys.path.insert(0, str(project_root))
-            
-            from src.utils.browser_cookies import get_wb_cookies
-            
-            logger.info("Попытка автоматического получения cookies из браузера Chrome...")
-            
-            # Получаем cookies (синхронная функция, но вызываем в executor)
-            loop = asyncio.get_event_loop()
-            cookies_string = await loop.run_in_executor(None, get_wb_cookies, True)
-            
-            if cookies_string:
-                self.custom_cookies = cookies_string
-                await self._load_custom_cookies()
-                logger.success("✓ Cookies успешно получены из браузера")
-            else:
-                logger.warning("Не удалось получить cookies из браузера автоматически")
-                
-        except ImportError as e:
-            logger.warning(f"Библиотеки для работы с браузером не установлены: {e}")
-            logger.info("Установите: python -m pip install undetected-chromedriver selenium")
-        except Exception as e:
-            logger.warning(f"Ошибка при автоматическом получении cookies: {e}")
-            logger.debug("Продолжаем без автоматических cookies")
-    
-    async def _refresh_cookies_from_browser(self):
-        """Обновляет cookies из браузера (используется при ошибке 498)."""
-        try:
-            import sys
-            from pathlib import Path
-            # Добавляем путь к корню проекта для импорта
-            project_root = Path(__file__).parent.parent.parent
-            if str(project_root) not in sys.path:
-                sys.path.insert(0, str(project_root))
-            
-            from src.utils.browser_cookies import get_wb_cookies
-            
-            logger.info("Обновление cookies из браузера...")
-            
-            loop = asyncio.get_event_loop()
-            cookies_string = await loop.run_in_executor(None, get_wb_cookies, True)
-            
-            if cookies_string:
-                self.custom_cookies = cookies_string
-                await self._load_custom_cookies()
-                logger.success("✓ Cookies обновлены из браузера")
-                return True
-            else:
-                logger.warning("Не удалось обновить cookies из браузера")
-                return False
-                
-        except Exception as e:
-            logger.warning(f"Ошибка при обновлении cookies: {e}")
-            return False
     
     async def _load_custom_cookies(self):
-        """Загружает cookies из строки формата 'name1=value1; name2=value2'."""
+        """Загружает cookies из строки формата 'name1=value1; name2=value2'.
+        
+        КРИТИЧНО: Добавляет cookies как в кэш (_cookies_dict), так и в session.cookies
+        curl_cffi для автоматической отправки при запросах.
+        """
         try:
             from http.cookies import SimpleCookie
             
@@ -142,6 +81,55 @@ class WBCatalogAPI:
             
             # Обновляем кэш cookies
             self._cookies_dict.update(cookies_dict)
+            
+            # КРИТИЧНО: Добавляем cookies в session.cookies curl_cffi
+            # Без этого curl_cffi не будет отправлять cookies автоматически
+            if self.session:
+                cookies_added_to_session = 0
+                for name, value in cookies_dict.items():
+                    try:
+                        # Добавляем cookie в сессию curl_cffi
+                        # Используем домен wildberries.ru для всех cookies
+                        self.session.cookies.set(
+                            name=name,
+                            value=value,
+                            domain='.wildberries.ru',  # Поддомены тоже
+                            path='/'
+                        )
+                        cookies_added_to_session += 1
+                        logger.debug(f"  • Cookie добавлен в session.cookies: {name}")
+                    except Exception as e:
+                        logger.warning(f"  • Не удалось добавить cookie {name} в session.cookies: {e}")
+                        # Пробуем альтернативный способ - через домен без точки
+                        try:
+                            self.session.cookies.set(
+                                name=name,
+                                value=value,
+                                domain='wildberries.ru',
+                                path='/'
+                            )
+                            cookies_added_to_session += 1
+                            logger.debug(f"  • Cookie {name} добавлен альтернативным способом")
+                        except Exception as e2:
+                            logger.debug(f"  • Альтернативный способ тоже не сработал для {name}: {e2}")
+                
+                # Проверяем количество cookies в session.cookies
+                session_cookies_count = 0
+                if hasattr(self.session, 'cookies'):
+                    try:
+                        if hasattr(self.session.cookies, 'get_dict'):
+                            session_cookies_count = len(self.session.cookies.get_dict())
+                        else:
+                            # Безопасный подсчет через try-except
+                            try:
+                                session_cookies_count = sum(1 for _ in self.session.cookies)
+                            except:
+                                session_cookies_count = 0
+                    except:
+                        session_cookies_count = 0
+                logger.debug(f"✓ Cookies в session.cookies после добавления: {session_cookies_count} (добавлено: {cookies_added_to_session})")
+            else:
+                logger.warning("⚠️ Сессия еще не создана, cookies будут добавлены позже")
             
             # Сохраняем cookies для использования в заголовках
             self._cookies_header = "; ".join([f"{name}={value}" for name, value in cookies_dict.items()])
@@ -166,11 +154,16 @@ class WBCatalogAPI:
             self._cookies_header = None
     
     async def _initialize_session(self):
-        """Инициализирует сессию, получая cookies с главной страницы."""
+        """Инициализирует сессию через запрос к главной странице.
+        
+        curl_cffi автоматически управляет cookies через сессию.
+        Если переданы custom_cookies, они добавляются в сессию.
+        """
         try:
-            logger.info("Инициализация сессии: получение cookies с главной страницы...")
+            logger.info("Инициализация сессии через запрос к главной странице WB...")
             
-            # Делаем запрос на главную страницу для получения базовых cookies
+            # Делаем запрос на главную страницу
+            # curl_cffi автоматически сохранит cookies в сессию
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -187,65 +180,66 @@ class WBCatalogAPI:
                 "sec-ch-ua-platform": '"Windows"',
             }
             
-            # Добавляем cookies если есть
-            if self._cookies_header:
-                headers["Cookie"] = self._cookies_header
+            # НЕ добавляем Cookie заголовок вручную - curl_cffi автоматически отправит cookies из session.cookies
+            # Если cookies были загружены в _load_custom_cookies(), они уже в session.cookies
+            # Если добавить Cookie заголовок вручную, это может конфликтовать с автоматической отправкой
             
             response = await self.session.get("https://www.wildberries.ru/", headers=headers)
             
-            # Обновляем cookies из ответа
+            # КРИТИЧНО: Извлекаем cookies даже при ошибке 498 (антибот может вернуть cookies)
+            # curl_cffi автоматически сохранил cookies в session.cookies
+            # Синхронизируем с нашим кэшем для совместимости
+            cookies_before = len(self._cookies_dict)
+            
+            if hasattr(self.session, 'cookies'):
+                for cookie in self.session.cookies:
+                    self._cookies_dict[cookie.name] = cookie.value
+            
+            # Также обновляем из response.cookies (даже при ошибке 498 могут быть cookies)
             if response.cookies:
                 for name, value in response.cookies.items():
                     self._cookies_dict[name] = value
-                    # Также обновляем в сессии curl_cffi
+            
+            # КРИТИЧНО: Парсим Set-Cookie заголовки напрямую (curl_cffi может не обработать при 498)
+            if hasattr(response, 'headers'):
+                set_cookie_headers = []
+                # Пробуем разные способы получения Set-Cookie
+                if hasattr(response.headers, 'get_list'):
                     try:
-                        self.session.cookies.set(name=name, value=value, domain='www.wildberries.ru', path='/')
+                        set_cookie_headers = response.headers.get_list("Set-Cookie")
                     except:
                         pass
+                
+                if not set_cookie_headers:
+                    # Альтернативный способ
+                    set_cookie_headers = [v for k, v in response.headers.items() if k.lower() == 'set-cookie']
+                
+                if set_cookie_headers:
+                    from http.cookies import SimpleCookie
+                    for set_cookie in set_cookie_headers:
+                        try:
+                            cookie = SimpleCookie()
+                            cookie.load(set_cookie)
+                            for name, morsel in cookie.items():
+                                self._cookies_dict[name] = morsel.value
+                        except Exception as e:
+                            logger.debug(f"Ошибка парсинга Set-Cookie: {e}")
             
             # Обновляем заголовок cookies
             self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
             
-            cookies_count = len(self._cookies_dict)
-            logger.info(f"Получено cookies с главной страницы: {cookies_count}")
+            cookies_after = len(self._cookies_dict)
+            cookies_added = cookies_after - cookies_before
+            
+            if response.status_code == 498:
+                logger.warning(f"⚠️ Запрос к главной странице вернул 498, но получено cookies: {cookies_added}")
+            else:
+                logger.info(f"✅ Запрос к главной странице успешен (статус {response.status_code}), получено cookies: {cookies_added}")
+            
+            logger.info(f"Инициализация завершена. Всего cookies в сессии: {cookies_after}")
             
             # Небольшая задержка для имитации поведения браузера
-            await asyncio.sleep(1.0)
-            
-            # Пробуем получить токен антибота через разные эндпоинты
-            token_urls = [
-                "https://www.wildberries.ru/__wbaas/challenges/antibot/token",
-                "https://www.wildberries.ru/__wbaas/challenges/antibot/verify"
-            ]
-            
-            for token_url in token_urls:
-                try:
-                    token_headers = {
-                        "Accept": "application/json",
-                        "Referer": "https://www.wildberries.ru/",
-                    }
-                    if self._cookies_header:
-                        token_headers["Cookie"] = self._cookies_header
-                    
-                    token_response = await self.session.get(token_url, headers=token_headers)
-                    if token_response.status_code == 200:
-                        try:
-                            token_data = token_response.json()
-                            logger.debug(f"Токен антибота получен с {token_url}")
-                            # Сохраняем токен если он есть в ответе
-                            if isinstance(token_data, dict) and "token" in token_data:
-                                token = token_data["token"]
-                                self._cookies_dict["x_wbaas_token"] = token
-                                self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
-                                logger.debug("Токен добавлен в cookies")
-                                break
-                        except Exception:
-                            pass
-                    else:
-                        logger.debug(f"Токен не получен с {token_url}: статус {token_response.status_code}")
-                except Exception as e:
-                    logger.debug(f"Ошибка при получении токена с {token_url}: {e}")
-                    continue
+            await asyncio.sleep(0.5)
                         
         except Exception as e:
             logger.warning(f"Не удалось инициализировать сессию: {e}, продолжаем...")
@@ -290,11 +284,35 @@ class WBCatalogAPI:
                 logger.debug(f"  • URL: {url}")
                 logger.debug(f"  • dest в URL: {dest}")
                 
-                # Используем кэшированные cookies
-                cookies_dict = self._cookies_dict.copy()
+                # КРИТИЧНО: curl_cffi автоматически отправляет cookies из session.cookies
+                # НЕ добавляем Cookie заголовок вручную - пусть curl_cffi делает это автоматически
+                # Это важно для правильной работы с cookies при ошибках
                 
-                # Формируем строку cookies для заголовка
-                cookies_string = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()]) if cookies_dict else None
+                # Синхронизируем cookies из session.cookies с нашим кэшем
+                if hasattr(self.session, 'cookies'):
+                    try:
+                        # curl_cffi может возвращать cookies как словарь или как итерируемый объект
+                        if hasattr(self.session.cookies, 'get_dict'):
+                            # Если есть метод get_dict, используем его
+                            cookies_from_session = self.session.cookies.get_dict()
+                            self._cookies_dict.update(cookies_from_session)
+                        else:
+                            # Иначе итерируемся по cookies
+                            for cookie in self.session.cookies:
+                                # Проверяем тип: может быть объект cookie или строка
+                                if isinstance(cookie, str):
+                                    # Если это строка, пропускаем (неправильный формат)
+                                    continue
+                                elif hasattr(cookie, 'name') and hasattr(cookie, 'value'):
+                                    self._cookies_dict[cookie.name] = cookie.value
+                                elif isinstance(cookie, tuple) and len(cookie) == 2:
+                                    # Может быть кортеж (name, value)
+                                    self._cookies_dict[cookie[0]] = cookie[1]
+                    except Exception as e:
+                        logger.debug(f"Ошибка при синхронизации cookies из session.cookies: {e}")
+                
+                # Обновляем заголовок для логирования
+                self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
                 
                 # Обновляем заголовки для API запроса (более реалистичные)
                 api_headers = {
@@ -315,32 +333,96 @@ class WBCatalogAPI:
                     "sec-ch-ua-platform": '"Windows"',
                 }
                 
-                # Добавляем cookies в заголовки
-                if cookies_string:
-                    api_headers["Cookie"] = cookies_string
-                    logger.debug(f"Отправляем {len(cookies_dict)} cookies в заголовке")
+                # НЕ добавляем Cookie заголовок - curl_cffi сделает это автоматически из session.cookies
+                # Проверяем реальное количество cookies в session.cookies (curl_cffi будет их отправлять)
+                session_cookies_count = 0
+                if hasattr(self.session, 'cookies'):
+                    session_cookies_count = len(list(self.session.cookies))
                 
-                # Логируем ключевые cookies
+                cookies_count = len(self._cookies_dict)
+                if session_cookies_count > 0:
+                    logger.debug(f"Cookies в сессии curl_cffi: {session_cookies_count} (отправятся автоматически)")
+                    logger.debug(f"Cookies в кэше: {cookies_count}")
+                else:
+                    logger.warning(f"⚠️ Cookies в session.cookies отсутствуют! (в кэше: {cookies_count})")
+                
+                # Логируем ключевые cookies для диагностики
                 important_cookies = ["wbx-validation-key", "x_wbaas_token", "_wbauid", "_cp", "routeb"]
-                found_important = [c for c in important_cookies if c in cookies_dict]
+                found_important = [c for c in important_cookies if c in self._cookies_dict]
                 if found_important:
-                    logger.debug(f"Найдены важные cookies: {', '.join(found_important)}")
+                    logger.debug(f"Найдены важные cookies в сессии: {', '.join(found_important)}")
+                else:
+                    logger.debug(f"⚠️ Важные cookies отсутствуют: {', '.join(important_cookies)}")
                 
                 response = await self.session.get(url, headers=api_headers)
                 elapsed_time = time.time() - start_time
+                
+                # КРИТИЧНО: Синхронизируем cookies из session.cookies (curl_cffi автоматически управляет)
+                cookies_before_sync = len(self._cookies_dict)
+                if hasattr(self.session, 'cookies'):
+                    try:
+                        # curl_cffi может возвращать cookies как словарь или как итерируемый объект
+                        if hasattr(self.session.cookies, 'get_dict'):
+                            # Если есть метод get_dict, используем его
+                            cookies_from_session = self.session.cookies.get_dict()
+                            self._cookies_dict.update(cookies_from_session)
+                        else:
+                            # Иначе итерируемся по cookies
+                            for cookie in self.session.cookies:
+                                # Проверяем тип: может быть объект cookie или строка
+                                if isinstance(cookie, str):
+                                    # Если это строка, пропускаем (неправильный формат)
+                                    continue
+                                elif hasattr(cookie, 'name') and hasattr(cookie, 'value'):
+                                    self._cookies_dict[cookie.name] = cookie.value
+                                elif isinstance(cookie, tuple) and len(cookie) == 2:
+                                    # Может быть кортеж (name, value)
+                                    self._cookies_dict[cookie[0]] = cookie[1]
+                    except Exception as e:
+                        logger.debug(f"Ошибка при синхронизации cookies из session.cookies после запроса: {e}")
+                
+                # КРИТИЧНО: Обновляем cookies из ответа ДО проверки статуса
+                # (даже при ошибке 498 могут быть cookies в ответе)
+                if response.cookies:
+                    for name, value in response.cookies.items():
+                        self._cookies_dict[name] = value
+                
+                # Также парсим Set-Cookie заголовки напрямую (curl_cffi может не обработать при 498)
+                if hasattr(response, 'headers'):
+                    set_cookie_headers = []
+                    if hasattr(response.headers, 'get_list'):
+                        try:
+                            set_cookie_headers = response.headers.get_list("Set-Cookie")
+                        except:
+                            pass
+                    
+                    if not set_cookie_headers:
+                        set_cookie_headers = [v for k, v in response.headers.items() if k.lower() == 'set-cookie']
+                    
+                    if set_cookie_headers:
+                        from http.cookies import SimpleCookie
+                        for set_cookie in set_cookie_headers:
+                            try:
+                                cookie = SimpleCookie()
+                                cookie.load(set_cookie)
+                                for name, morsel in cookie.items():
+                                    self._cookies_dict[name] = morsel.value
+                                    logger.debug(f"  • Извлечен cookie из Set-Cookie: {name}")
+                            except Exception as e:
+                                logger.debug(f"  • Ошибка парсинга Set-Cookie: {e}")
+                
+                # Обновляем заголовок cookies
+                self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
+                
+                cookies_after_sync = len(self._cookies_dict)
+                cookies_added = cookies_after_sync - cookies_before_sync
+                if cookies_added > 0:
+                    logger.debug(f"  • Обновлено cookies после запроса: +{cookies_added} (всего: {cookies_after_sync})")
                 
                 if response.status_code == 200:
                     try:
                         data = response.json()
                         products_count = len(data.get("products", []))
-                        
-                        # Обновляем cookies из ответа
-                        if response.cookies:
-                            for name, value in response.cookies.items():
-                                self._cookies_dict[name] = value
-                            
-                            # Обновляем заголовок cookies
-                            self._cookies_header = "; ".join([f"{k}={v}" for k, v in self._cookies_dict.items()])
                         
                         logger.info(
                             f"✅ Страница {page}: успешно загружена за {elapsed_time:.2f} сек. "
@@ -381,37 +463,40 @@ class WBCatalogAPI:
                     except:
                         pass
                     
+                    # Проверяем cookies в сессии curl_cffi
+                    session_cookies_count = 0
+                    if hasattr(self.session, 'cookies'):
+                        try:
+                            if hasattr(self.session.cookies, 'get_dict'):
+                                session_cookies_count = len(self.session.cookies.get_dict())
+                            else:
+                                # Безопасный подсчет через try-except
+                                try:
+                                    session_cookies_count = sum(1 for _ in self.session.cookies)
+                                except:
+                                    session_cookies_count = 0
+                        except:
+                            session_cookies_count = 0
                     
-                    # Проверяем, какие cookies были отправлены
-                    sent_cookies = api_headers.get("Cookie", "НЕТ")
-                    cookies_count = len(cookies_dict)
+                    cookies_count = len(self._cookies_dict)
+                    
+                    # Проверяем наличие важных cookies
+                    important_cookies = ["wbx-validation-key", "x_wbaas_token", "_wbauid", "_cp", "routeb"]
+                    found_important = [c for c in important_cookies if c in self._cookies_dict]
                     
                     logger.error(
                         f"Ошибка 498 при запросе страницы {page} для продавца {supplier_id}\n"
                         f"URL: {url}\n"
-                        f"Отправлено cookies в заголовке: {'ДА' if sent_cookies != 'НЕТ' else 'НЕТ'} ({len(sent_cookies) if sent_cookies != 'НЕТ' else 0} символов)\n"
+                        f"Cookies в сессии curl_cffi: {session_cookies_count} штук\n"
                         f"Cookies в кэше: {cookies_count} штук\n"
+                        f"Важные cookies найдены: {', '.join(found_important) if found_important else 'НЕТ'}\n"
                         f"Response headers: {dict(response.headers)}\n"
                         f"Response body (первые 500 символов): {response_text[:500]}"
                     )
                     
-                    # Если это первая попытка, пробуем обновить cookies из браузера
-                    if retry_count == 0 and self.auto_get_cookies:
-                        logger.warning("Попытка обновить cookies из браузера...")
-                        cookies_updated = await self._refresh_cookies_from_browser()
-                        
-                        if cookies_updated:
-                            await asyncio.sleep(2.0)
-                            return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
-                        else:
-                            # Если не получилось обновить, пробуем переинициализировать сессию
-
-                            await self._initialize_session()
-                            await asyncio.sleep(2.0)
-                            return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
-                    elif retry_count == 0 and self.custom_cookies:
-                        # Если автоматическое получение отключено, пробуем переинициализировать
-                        logger.warning("Попытка переинициализации сессии с обновленными cookies...")
+                    # Если это первая попытка, пробуем переинициализировать сессию
+                    if retry_count == 0:
+                        logger.warning("Попытка переинициализации сессии...")
                         await self._initialize_session()
                         await asyncio.sleep(2.0)
                         return await self._fetch_page(supplier_id, dest, spp, page, retry_count + 1)
