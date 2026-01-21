@@ -491,10 +491,11 @@ def export_results(results: List[Dict], output_dir: Path):
         
         # Добавляем расчетные столбцы ПЕРЕД определением порядка
         
-        # 1. Цена с картой 10% = Цена с СПП * 0.9
+        # 1. Цена с картой 10% = Цена с СПП * 0.9 (округляем вниз)
+        import math
         if 'Цена с СПП' in df.columns:
             df['Цена с картой 10%'] = df['Цена с СПП'].apply(
-                lambda x: x * 0.9 if x is not None and pd.notna(x) else None
+                lambda x: math.floor(x * 0.9) if x is not None and pd.notna(x) else None
             )
         
         # 2. Процент СПП = (Цена до СПП - Цена с СПП) / Цена до СПП * 100
@@ -520,7 +521,8 @@ def export_results(results: List[Dict], output_dir: Path):
                         f"{percent:.2f}% (Цена до СПП={price_before_spp}, Цена с СПП={price_prod})"
                     )
                 
-                return percent
+                # Округляем до 2 знаков после запятой
+                return round(percent, 2) if percent is not None else None
             
             df['Процент СПП'] = df.apply(calculate_spp_percent, axis=1)
         
