@@ -50,12 +50,33 @@ def load_env_config() -> Dict:
         else:
             cookies_string = None
         
+        # Читаем location для получения цен с учётом ПВЗ
+        location = None
+        area_id = os.getenv("OZON_LOCATION_AREA_ID")
+        if area_id:
+            try:
+                location = {
+                    "areaId": int(area_id),
+                    "areaType": int(os.getenv("OZON_LOCATION_AREA_TYPE", "4")),
+                    "city": os.getenv("OZON_LOCATION_CITY", "Москва"),
+                    "country": os.getenv("OZON_LOCATION_COUNTRY", "Россия"),
+                    "countryCode": os.getenv("OZON_LOCATION_COUNTRY_CODE", "RUS"),
+                    "countryId": int(os.getenv("OZON_LOCATION_COUNTRY_ID", "1")),
+                    "fias": os.getenv("OZON_LOCATION_FIAS", ""),
+                    "name": os.getenv("OZON_LOCATION_NAME", "Москва"),
+                }
+                # Удаляем пустые значения
+                location = {k: v for k, v in location.items() if v}
+            except (ValueError, TypeError) as e:
+                logger.warning(f"⚠️ Ошибка при парсинге location: {e}. Продолжаем без location.")
+        
         return {
             "ozon_client_id": int(os.getenv("OZON_CLIENT_ID", "0")),
             "ozon_api_key": os.getenv("OZON_API_KEY", ""),
             "ozon_seller_id": int(os.getenv("OZON_SELLER_ID_COSMO", "176640")),
             "ozon_seller_name": os.getenv("OZON_SELLER_NAME_COSMO", "cosmo-beauty"),
             "ozon_cookies": cookies_string,
+            "ozon_location": location,
         }
     except Exception as e:
         logger.error(f"Ошибка при загрузке конфигурации: {e}")
@@ -64,6 +85,7 @@ def load_env_config() -> Dict:
             "ozon_api_key": "",
             "ozon_seller_id": 176640,
             "ozon_seller_name": "cosmo-beauty",
+            "ozon_location": None,
         }
 
 
@@ -111,11 +133,24 @@ async def parse_seller():
     else:
         logger.info("ℹ️ Cookies не указаны в .env - будет попытка автоматического получения")
     
+    location = config.get("ozon_location")
+    
+    if location:
+        logger.info(
+            f"📍 Используется location для получения цен с учётом ПВЗ:\n"
+            f"  • Город: {location.get('city', 'N/A')}\n"
+            f"  • Area ID: {location.get('areaId', 'N/A')}\n"
+            f"  • FIAS: {location.get('fias', 'N/A')[:20]}..." if location.get('fias') else "  • FIAS: N/A"
+        )
+    else:
+        logger.info("ℹ️ Location не указан - цены будут без учёта ПВЗ")
+    
     parser = OzonParser(
         client_id=client_id,
         api_key=api_key,
         request_delay=0.5,
-        cookies=cookies
+        cookies=cookies,
+        location=location
     )
     
     try:
@@ -174,6 +209,8 @@ def export_results(results: List[Dict], output_dir: Path):
             'discount_percent': 'Скидка %',
             'price_seller': 'Цена продавца',
             'price_old': 'Зачёркнутая цена (API)',
+            'price_with_spp': 'Цена с СПП',
+            'spp_percent': 'Процент СПП',
         }
         
         # Удаляем ненужные столбцы перед переименованием
@@ -200,9 +237,11 @@ def export_results(results: List[Dict], output_dir: Path):
             'ID кабинета',
             'Кабинет',
             'Цена покупателя',
-            'Скидка %',
+            'Цена с СПП',
             'Цена продавца',
             'Зачёркнутая цена (API)',
+            'Процент СПП',
+            'Скидка %',
             'product_id_seller',
         ]
         

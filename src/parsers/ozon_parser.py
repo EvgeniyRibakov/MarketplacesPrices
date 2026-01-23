@@ -9,7 +9,7 @@ class OzonParser:
     """Парсер цен для Ozon."""
     
     def __init__(self, client_id: int, api_key: str, request_delay: float = 0.5, 
-                 cookies: Optional[str] = None):
+                 cookies: Optional[str] = None, location: Optional[Dict] = None):
         """Инициализация парсера.
         
         Args:
@@ -17,11 +17,13 @@ class OzonParser:
             api_key: API ключ продавца
             request_delay: Задержка между запросами
             cookies: Опциональные cookies в формате "name1=value1; name2=value2"
+            location: Опциональные данные location для получения цен с учётом ПВЗ
         """
         self.client_id = client_id
         self.api_key = api_key
         self.request_delay = request_delay
         self.cookies = cookies
+        self.location = location
     
     async def parse_seller_catalog(self, seller_id: int, seller_name: str) -> List[Dict]:
         """Парсинг каталога продавца через публичный API и Seller API.
@@ -76,7 +78,8 @@ class OzonParser:
             max_concurrent=3,
             cookies=self.cookies,
             auto_get_cookies=True if not self.cookies else False,
-            mode=mode
+            mode=mode,
+            location=self.location
         ) as catalog_api:
             catalog_products = await catalog_api.fetch_seller_catalog(seller_id, seller_name, max_products=max_products)
         
@@ -139,6 +142,14 @@ class OzonParser:
                         product_id_key = str(product_id) if product_id else None
                         product_name = product_names.get(product_id_key) if product_id_key and product_names else None
                         
+                        # Вычисляем цену с СПП и процент СПП (если есть цена покупателя)
+                        price_seller = parsed.get("seller_price")
+                        price_current = None  # Нет данных из публичного каталога
+                        price_with_spp = None
+                        spp_percent = None
+                        
+                        # Если нет цены покупателя, то и СПП не вычисляем
+                        
                         result = {
                             "product_id": product_id,
                             "product_id_seller": product_id,  # Для совместимости
@@ -146,13 +157,15 @@ class OzonParser:
                             "product_name": product_name,
                             "cabinet_id": seller_id,
                             "cabinet_name": cabinet_name,
-                            "price_seller": parsed.get("seller_price"),
+                            "price_seller": price_seller,
                             "price_old": parsed.get("old_price"),
                             "price_min": parsed.get("min_price"),
                             "currency": parsed.get("currency", "RUB"),
-                            "price_current": None,  # Нет данных из публичного каталога
+                            "price_current": price_current,  # Нет данных из публичного каталога
                             "price_original": parsed.get("old_price"),
                             "discount_percent": None,
+                            "price_with_spp": price_with_spp,  # Цена с СПП = Цена продавца - Цена покупателя
+                            "spp_percent": spp_percent,  # Процент СПП = 1 - (Цена с СПП / Цена продавца)
                             "source_catalog": None,
                             "source_seller": "seller_api",
                         }
@@ -326,6 +339,19 @@ class OzonParser:
                 if final_old_price > 0 and final_old_price > current_price:
                     discount_percent = round(((final_old_price - current_price) / final_old_price) * 100, 1)
             
+            # Вычисляем цену с СПП и процент СПП
+            price_seller = seller_price_data.get("seller_price")
+            price_with_spp = None
+            spp_percent = None
+            
+            if price_seller is not None and current_price is not None:
+                # Цена с СПП = Цена продавца - Цена покупателя
+                price_with_spp = round(price_seller - current_price, 2)
+                # Процент СПП = 1 - (Цена с СПП / Цена продавца) * 100
+                # Это показывает долю цены покупателя от цены продавца в процентах
+                if price_seller > 0:
+                    spp_percent = round((1 - (price_with_spp / price_seller)) * 100, 2)
+            
             result = {
                 # Основные данные
                 "product_id": sku,  # SKU из публичного API (глобальный идентификатор)
@@ -341,9 +367,13 @@ class OzonParser:
                 "discount_percent": discount_percent,
                 
                 # Цены из Seller API (цены продавца) - ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ
-                "price_seller": seller_price_data.get("seller_price"),  # Цена продавца (без акций)
+                "price_seller": price_seller,  # Цена продавца (без акций)
                 "price_old": final_old_price,  # Зачёркнутая цена (то же, что price_original - из Seller API old_price)
                 "price_min": seller_price_data.get("min_price"),  # Минимальная цена
+                
+                # Вычисляемые поля
+                "price_with_spp": price_with_spp,  # Цена с СПП = Цена продавца - Цена покупателя
+                "spp_percent": spp_percent,  # Процент СПП = 1 - (Цена с СПП / Цена продавца)
                 
                 # Источники данных
                 "source_catalog": "catalog_api",

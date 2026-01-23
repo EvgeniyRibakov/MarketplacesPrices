@@ -35,7 +35,8 @@ class OzonCatalogAPI:
     
     def __init__(self, request_delay: float = 3.0, max_concurrent: int = 2, 
                  auto_get_cookies: bool = True, cookies: Optional[str] = None,
-                 proxy: Optional[str] = None, mode: Optional[str] = None):
+                 proxy: Optional[str] = None, mode: Optional[str] = None,
+                 location: Optional[Dict] = None):
         """Инициализация клиента.
         
         Args:
@@ -46,6 +47,8 @@ class OzonCatalogAPI:
             proxy: Опциональный прокси-сервер в формате "http://host:port" или "socks5://host:port"
             mode: Режим работы - "light" (HTTP-only, без Playwright) или "full" (с Playwright fallback)
                   Если None, читается из OZON_MODE в .env (по умолчанию "full")
+            location: Опциональные данные location для получения цен с учётом ПВЗ
+                      Формат: {"areaId": 2, "city": "Москва", "fias": "0c5b2444-70a0-4932-980c-b4dc0d3f02b5", ...}
         """
         self.request_delay = request_delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
@@ -53,6 +56,7 @@ class OzonCatalogAPI:
         self.auto_get_cookies = auto_get_cookies
         self.custom_cookies = cookies
         self.proxy = proxy
+        self.location = location
         
         # Определяем режим работы
         if mode is None:
@@ -621,6 +625,49 @@ class OzonCatalogAPI:
                     logger.debug(f"  • Открываем страницу продавца: {seller_page_url}")
                     await page.goto(seller_page_url, wait_until='networkidle', timeout=30000)
                     await asyncio.sleep(1)  # Небольшая задержка для загрузки
+                    
+                    # Устанавливаем location через JavaScript, если указан
+                    if self.location:
+                        try:
+                            import json
+                            location_js = {
+                                "current": {
+                                    "areaId": self.location.get('areaId'),
+                                    "areaType": self.location.get('areaType', 4),
+                                    "city": self.location.get('city', 'Москва'),
+                                    "country": self.location.get('country', 'Россия'),
+                                    "countryCode": self.location.get('countryCode', 'RUS'),
+                                    "countryId": self.location.get('countryId', 1),
+                                    "fias": self.location.get('fias', ''),
+                                    "name": self.location.get('name', 'Москва'),
+                                }
+                            }
+                            # Устанавливаем location в localStorage и sessionStorage
+                            location_json = json.dumps(location_js, ensure_ascii=False)
+                            # Экранируем для JavaScript
+                            location_json_escaped = location_json.replace("'", "\\'").replace("\n", "\\n")
+                            await page.evaluate(f"""
+                                (function() {{
+                                    try {{
+                                        const locationData = {location_json};
+                                        if (typeof localStorage !== 'undefined') {{
+                                            localStorage.setItem('ozon_location', JSON.stringify(locationData));
+                                        }}
+                                        if (typeof sessionStorage !== 'undefined') {{
+                                            sessionStorage.setItem('ozon_location', JSON.stringify(locationData));
+                                        }}
+                                        if (typeof window !== 'undefined') {{
+                                            window.ozonLocation = locationData;
+                                        }}
+                                    }} catch(e) {{
+                                        console.error('Ошибка установки location:', e);
+                                    }}
+                                }})();
+                            """)
+                            logger.debug(f"  • Location установлен через JavaScript: {self.location.get('city', 'N/A')}")
+                            await asyncio.sleep(0.5)  # Небольшая задержка после установки location
+                        except Exception as e:
+                            logger.debug(f"  • Ошибка при установке location через JavaScript: {e}")
                 
                 # Делаем запрос к API через Playwright
                 headers = {
@@ -685,6 +732,9 @@ class OzonCatalogAPI:
         if search_page_state:
             params['search_page_state'] = search_page_state
         
+        # НЕ добавляем location в URL - это ломает структуру ответа API
+        # Location устанавливается через JavaScript в Playwright (см. _fetch_page_via_playwright)
+        
         # Формируем query string
         query_string = '&'.join([f"{k}={quote(str(v))}" for k, v in params.items()])
         
@@ -701,6 +751,7 @@ class OzonCatalogAPI:
         logger.debug(f"  • page: {page}")
         logger.debug(f"  • paginator_token: {paginator_token}")
         logger.debug(f"  • search_page_state: {search_page_state}")
+        logger.debug(f"  • location: {self.location}")
         logger.debug(f"  • seller_url: {seller_url}")
         logger.debug(f"  • query_string: {query_string}")
         logger.debug(f"  • full_seller_url: {full_seller_url}")
@@ -1419,10 +1470,24 @@ class OzonCatalogAPI:
             # Ищем widgetStates с товарами
             widget_states = page_data.get("widgetStates", {})
             
+            logger.debug(f"🔍 ПАРСИНГ ТОВАРОВ: widgetStates найдено: {len(widget_states)} состояний")
+            logger.debug(f"  • Ключи widgetStates: {list(widget_states.keys())[:10]}")
+            
+            # Ищем товары в разных типах виджетов
+            # tileGridDesktop - основной виджет со списком товаров
+            # Также могут быть другие варианты: tileGrid, grid, catalog, productList и т.д.
+            product_widget_patterns = ['tileGridDesktop', 'tileGrid', 'grid', 'catalog', 'productList', 'sellerProducts']
+            
+            tile_grid_found = False
             for state_id, state_json in widget_states.items():
-                # Ищем состояния с типом tileGridDesktop (список товаров)
-                if "tileGridDesktop" not in state_id:
+                # Проверяем, содержит ли state_id один из паттернов товаров
+                is_product_widget = any(pattern in state_id.lower() for pattern in product_widget_patterns)
+                
+                if not is_product_widget:
                     continue
+                
+                tile_grid_found = True
+                logger.debug(f"  • Найден виджет с товарами: {state_id}")
                 
                 # Парсим JSON из строки
                 import json
@@ -1432,7 +1497,21 @@ class OzonCatalogAPI:
                     # Если уже dict, используем как есть
                     state_data = state_json
                 
+                logger.debug(f"  • Ключи в state_data: {list(state_data.keys())[:15]}")
+                
                 items = state_data.get("items", [])
+                logger.debug(f"  • Найдено items в виджете {state_id}: {len(items)}")
+                
+                if not items:
+                    # Проверяем альтернативные места для товаров
+                    logger.debug(f"  • items пустой, ищем альтернативные места...")
+                    # Может быть в других ключах
+                    for key in ['products', 'catalog', 'list', 'data']:
+                        alt_items = state_data.get(key, [])
+                        if alt_items:
+                            logger.debug(f"  • Найдено {len(alt_items)} товаров в ключе '{key}'")
+                            items = alt_items
+                            break
                 
                 for item in items:
                     try:
@@ -1452,10 +1531,63 @@ class OzonCatalogAPI:
                         sku = item.get('sku', 'N/A') if isinstance(item, dict) else 'N/A'
                         logger.debug(f"  ✗ SKU {sku}: ошибка парсинга - {e}")
                         continue
+            
+            if not tile_grid_found:
+                logger.warning(f"⚠️ Виджеты с товарами не найдены в widgetStates. Проверяем все виджеты...")
+                # Проверяем ВСЕ виджеты на наличие товаров (может быть другой формат)
+                for state_id, state_json in widget_states.items():
+                    try:
+                        import json
+                        try:
+                            state_data = json.loads(state_json)
+                        except:
+                            state_data = state_json
+                        
+                        # Проверяем, есть ли в этом виджете items или products
+                        for items_key in ['items', 'products', 'catalog', 'list', 'data']:
+                            alt_items = state_data.get(items_key, [])
+                            if isinstance(alt_items, list) and alt_items:
+                                # Проверяем, что это действительно товары (есть поле sku)
+                                sample_item = alt_items[0] if alt_items else {}
+                                if isinstance(sample_item, dict) and ('sku' in sample_item or 'id' in sample_item or 'productId' in sample_item):
+                                    logger.debug(f"  • Найдено {len(alt_items)} товаров в виджете '{state_id}' (ключ '{items_key}')")
+                                    # Парсим товары
+                                    for item in alt_items:
+                                        try:
+                                            product = OzonCatalogAPI.parse_product(item)
+                                            if product:
+                                                products.append(product)
+                                        except:
+                                            continue
+                                    break
+                    except Exception as e:
+                        logger.debug(f"  • Ошибка при проверке виджета '{state_id}': {e}")
+                        continue
+                
+                # Также проверяем другие возможные места для товаров
+                for key in ['layout', 'shared', 'catalog']:
+                    section = page_data.get(key, {})
+                    if isinstance(section, dict):
+                        # Ищем вложенные структуры с товарами
+                        for sub_key in ['items', 'products', 'catalog', 'list']:
+                            if sub_key in section:
+                                alt_items = section[sub_key]
+                                if isinstance(alt_items, list) and alt_items:
+                                    logger.debug(f"  • Найдено {len(alt_items)} товаров в {key}.{sub_key}")
+                                    # Пробуем парсить
+                                    for item in alt_items:
+                                        try:
+                                            product = OzonCatalogAPI.parse_product(item)
+                                            if product:
+                                                products.append(product)
+                                        except:
+                                            continue
         
         except Exception as e:
             logger.error(f"Ошибка при парсинге страницы: {e}")
+            logger.debug("Детали ошибки:", exc_info=True)
         
+        logger.debug(f"🔍 ПАРСИНГ ТОВАРОВ: итого распарсено {len(products)} товаров")
         return products
     
     @staticmethod
