@@ -35,7 +35,7 @@ class OzonCatalogAPI:
     
     def __init__(self, request_delay: float = 3.0, max_concurrent: int = 2, 
                  auto_get_cookies: bool = True, cookies: Optional[str] = None,
-                 proxy: Optional[str] = None):
+                 proxy: Optional[str] = None, mode: Optional[str] = None):
         """Инициализация клиента.
         
         Args:
@@ -44,6 +44,8 @@ class OzonCatalogAPI:
             auto_get_cookies: Автоматически получать cookies из браузера если не переданы
             cookies: Опциональные cookies из браузера в формате "name1=value1; name2=value2"
             proxy: Опциональный прокси-сервер в формате "http://host:port" или "socks5://host:port"
+            mode: Режим работы - "light" (HTTP-only, без Playwright) или "full" (с Playwright fallback)
+                  Если None, читается из OZON_MODE в .env (по умолчанию "full")
         """
         self.request_delay = request_delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
@@ -51,38 +53,189 @@ class OzonCatalogAPI:
         self.auto_get_cookies = auto_get_cookies
         self.custom_cookies = cookies
         self.proxy = proxy
+        
+        # Определяем режим работы
+        if mode is None:
+            mode = os.getenv('OZON_MODE', 'full').lower().strip()
+        self.mode = mode if mode in ('light', 'full') else 'full'
+        
+        # Логируем предупреждение для LIGHT режима
+        if self.mode == 'light':
+            logger.warning(
+                "⚠️ LIGHT режим активирован: Playwright fallback отключен. "
+                "Риск блокировок повышен. Используйте cookies из файла (Cookies-as-a-Service)."
+            )
+        
         self._cookies_header: Optional[str] = None
         self._cookies_dict: Dict[str, str] = {}
         self._antibot_triggered_count: int = 0  # Счетчик срабатываний антибота
+        
+        # Адаптивный контроллер задержек (опционально, включается через .env)
+        self.use_adaptive_delay = os.getenv('OZON_ADAPTIVE_DELAY', 'true').lower() in ('true', '1', 'yes')
+        if self.use_adaptive_delay:
+            from src.utils.adaptive_delayer import AdaptiveDelayer
+            self.adaptive_delayer = AdaptiveDelayer(
+                initial_delay=request_delay,
+                min_delay=0.5,
+                max_delay=5.0
+            )
+        else:
+            self.adaptive_delayer = None
+        
+        # Playwright браузер и контекст (для переиспользования)
+        self._playwright_browser = None
+        self._playwright_context = None
+        self._playwright_p = None
+        self._playwright_manager = None  # Контекстный менеджер для Playwright
     
     async def __aenter__(self):
         """Асинхронный контекстный менеджер - вход."""
-        # Создаем сессию curl_cffi с эмуляцией Chrome 131
-        # Используем более полную эмуляцию браузера
-        self.session = AsyncSession(
-            impersonate="chrome131",
-            timeout=30,
-            # Дополнительные параметры для лучшей эмуляции браузера
-            verify=True,  # Проверка SSL сертификатов
-            allow_redirects=True,  # Следовать редиректам как браузер
-        )
+        # В FULL режиме используем только Playwright (curl_cffi всегда блокируется)
+        if self.mode == 'full':
+            # Инициализируем Playwright браузер один раз для всех запросов
+            try:
+                from playwright.async_api import async_playwright
+                # Используем async_playwright() как контекстный менеджер
+                self._playwright_manager = async_playwright()
+                self._playwright_p = await self._playwright_manager.__aenter__()
+                
+                headless_mode = get_playwright_headless()
+                launch_options = {
+                    'headless': headless_mode,
+                    'args': [
+                        '--no-sandbox',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                    ]
+                }
+                
+                self._playwright_browser = await self._playwright_p.chromium.launch(**launch_options)
+                
+                context_options = {
+                    'viewport': {'width': 1920, 'height': 1080},
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    'locale': 'ru-RU',
+                    'timezone_id': 'Europe/Moscow',
+                }
+                
+                if self.proxy:
+                    if self.proxy.startswith('http://') or self.proxy.startswith('https://'):
+                        context_options['proxy'] = {'server': self.proxy}
+                    elif self.proxy.startswith('socks5://'):
+                        context_options['proxy'] = {'server': self.proxy}
+                    else:
+                        context_options['proxy'] = {'server': f'http://{self.proxy}'}
+                
+                self._playwright_context = await self._playwright_browser.new_context(**context_options)
+                logger.info("🎭 Playwright браузер инициализирован (один экземпляр для всех запросов)")
+            except ImportError:
+                logger.warning("⚠️ Playwright не установлен, переключаемся на LIGHT режим")
+                self.mode = 'light'
+            except Exception as e:
+                logger.error(f"❌ Ошибка инициализации Playwright: {e}")
+                self.mode = 'light'
         
-        # Загружаем cookies если нужно
+        # В LIGHT режиме используем curl_cffi (но он обычно блокируется)
+        if self.mode == 'light':
+            self.session = AsyncSession(
+                impersonate="chrome131",
+                timeout=30,
+                verify=True,
+                allow_redirects=True,
+            )
+        
+        # Загружаем cookies в порядке приоритета (для Playwright они не критичны, но могут помочь)
+        # 1. Если переданы напрямую (custom_cookies) - используем их
+        # 2. Если есть файл cookies - загружаем из файла
+        # 3. Если auto_get_cookies=True - получаем из браузера
+        cookies_loaded = False
+        
         if self.custom_cookies:
             await self._load_custom_cookies()
+            cookies_loaded = True
         elif self.auto_get_cookies:
-            # Пробуем автоматически получить cookies из браузера (как в WB парсере)
-            await self._load_cookies_from_browser()
+            # Сначала пробуем загрузить из файла (Cookies-as-a-Service)
+            if await self._load_cookies_from_file():
+                cookies_loaded = True
+                logger.info("✓ Cookies загружены из файла (Cookies-as-a-Service)")
+            else:
+                # Fallback: получаем из браузера (как в WB парсере)
+                await self._load_cookies_from_browser()
+                cookies_loaded = True
         
-        # Инициализируем сессию с главной страницы (получаем cookies через curl_cffi)
-        init_success = await self._initialize_session()
-        if not init_success:
-            logger.warning("⚠️ Инициализация сессии не удалась, продолжаем без cookies")
+        # Инициализируем curl_cffi сессию только в LIGHT режиме (в FULL не нужна)
+        if self.mode == 'light':
+            init_success = await self._initialize_session()
+            if not init_success:
+                logger.warning("⚠️ Инициализация сессии не удалась, продолжаем без cookies")
         
         return self
     
+    async def _load_cookies_from_file(self) -> bool:
+        """Загружает cookies из JSON файла (Cookies-as-a-Service).
+        
+        Проверяет несколько возможных путей:
+        1. OZON_COOKIES_PATH из .env
+        2. cookies/ozon_cookies.json (по умолчанию)
+        
+        Returns:
+            True если cookies загружены, False если файл не найден
+        """
+        try:
+            import json
+            from pathlib import Path
+            
+            # Определяем путь к файлу cookies
+            cookies_path_env = os.getenv("OZON_COOKIES_PATH")
+            if cookies_path_env:
+                cookies_path = Path(cookies_path_env)
+            else:
+                # Путь по умолчанию
+                project_root = Path(__file__).parent.parent.parent
+                cookies_path = project_root / "cookies" / "ozon_cookies.json"
+            
+            if not cookies_path.exists():
+                logger.debug(f"Файл cookies не найден: {cookies_path}")
+                return False
+            
+            # Читаем JSON файл
+            with open(cookies_path, 'r', encoding='utf-8') as f:
+                cookies_data = json.load(f)
+            
+            # Поддерживаем два формата:
+            # 1. Новый формат: {"cookies": {...}, "cookies_string": "..."}
+            # 2. Старый формат: {"name": "value", ...}
+            if "cookies_string" in cookies_data:
+                cookies_string = cookies_data["cookies_string"]
+            elif "cookies" in cookies_data:
+                # Формируем строку из словаря cookies
+                cookies_dict = cookies_data["cookies"]
+                cookies_string = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
+            else:
+                # Старый формат - весь файл это словарь cookies
+                cookies_string = "; ".join([f"{k}={v}" for k, v in cookies_data.items()])
+            
+            if cookies_string:
+                self.custom_cookies = cookies_string
+                await self._load_custom_cookies()
+                logger.info(f"✓ Cookies загружены из файла: {cookies_path}")
+                return True
+            else:
+                logger.warning(f"Файл cookies пуст: {cookies_path}")
+                return False
+                
+        except json.JSONDecodeError as e:
+            logger.warning(f"Ошибка парсинга JSON файла cookies: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"Ошибка при загрузке cookies из файла: {e}")
+            return False
+    
     async def _load_cookies_from_browser(self):
-        """Автоматически загружает cookies из браузера Chrome (как в WB парсере)."""
+        """Автоматически загружает cookies из браузера Chrome (как в WB парсере).
+        
+        Используется как fallback, если файл cookies не найден.
+        """
         try:
             # Импортируем в функции, чтобы не было проблем если библиотека не установлена
             import sys
@@ -398,6 +551,23 @@ class OzonCatalogAPI:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Асинхронный контекстный менеджер - выход."""
+        # Закрываем Playwright браузер
+        if self._playwright_browser:
+            await self._playwright_browser.close()
+            self._playwright_browser = None
+            self._playwright_context = None
+            logger.info("🎭 Playwright браузер закрыт")
+        
+        # Закрываем контекстный менеджер Playwright
+        if self._playwright_manager:
+            try:
+                await self._playwright_manager.__aexit__(exc_type, exc_val, exc_tb)
+            except Exception as e:
+                logger.debug(f"Ошибка при закрытии Playwright менеджера: {e}")
+            self._playwright_manager = None
+            self._playwright_p = None
+        
+        # Закрываем curl_cffi сессию (если использовалась)
         if self.session:
             await self.session.close()
     
@@ -413,76 +583,30 @@ class OzonCatalogAPI:
         for name, value in list(self._cookies_dict.items())[:5]:  # Первые 5 cookies
             logger.debug(f"  • {name}: {value[:50]}{'...' if len(value) > 50 else ''}")
     
-    async def _fetch_page_via_playwright(self, url: str, seller_name: str, seller_id: int) -> Optional[Dict]:
-        """Выполняет запрос к entrypoint API через Playwright (fallback при блокировке curl_cffi).
+    async def _fetch_page_via_playwright(self, url: str, seller_name: str, seller_id: int, page_num: int = 1) -> Optional[Dict]:
+        """Выполняет запрос к entrypoint API через Playwright (использует переиспользуемый браузер).
         
         Args:
             url: URL для запроса к entrypoint API
             seller_name: Имя продавца (для Referer)
             seller_id: ID продавца
+            page_num: Номер страницы (для логирования)
             
         Returns:
             JSON данные ответа или None при ошибке
         """
         try:
-            from playwright.async_api import async_playwright
             from playwright_stealth import stealth
             
-            logger.info("🎭 Fallback: Выполняем запрос через Playwright (curl_cffi заблокирован)...")
-            if self.proxy:
-                logger.info(f"  • Используется прокси: {self.proxy}")
-            else:
-                logger.info(f"  • Прокси: НЕ ИСПОЛЬЗУЕТСЯ")
+            # Используем переиспользуемый браузер и контекст
+            if not self._playwright_context:
+                logger.error("❌ Playwright контекст не инициализирован")
+                return None
             
-            async with async_playwright() as p:
-                # Получаем настройку headless режима из переменной окружения
-                headless_mode = get_playwright_headless()
-                logger.debug(f"  • Headless режим Playwright: {headless_mode} (из OZON_PLAYWRIGHT_HEADLESS={os.getenv('OZON_PLAYWRIGHT_HEADLESS', 'true')})")
-                
-                # Настройка прокси для Playwright (если указан)
-                launch_options = {
-                    'headless': headless_mode,
-                    'args': [
-                        '--no-sandbox',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                    ]
-                }
-                
-                browser = await p.chromium.launch(**launch_options)
-                
-                # Настройка прокси для контекста браузера
-                context_options = {
-                    'viewport': {'width': 1920, 'height': 1080},
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                    'locale': 'ru-RU',
-                    'timezone_id': 'Europe/Moscow',
-                }
-                
-                # Добавляем прокси, если указан
-                if self.proxy:
-                    # Парсим прокси формат: http://host:port или socks5://host:port
-                    if self.proxy.startswith('http://') or self.proxy.startswith('https://'):
-                        context_options['proxy'] = {'server': self.proxy}
-                    elif self.proxy.startswith('socks5://'):
-                        context_options['proxy'] = {'server': self.proxy}
-                    else:
-                        # Если формат не указан, предполагаем http://
-                        context_options['proxy'] = {'server': f'http://{self.proxy}'}
-                    logger.debug(f"  • Playwright использует прокси: {context_options['proxy']}")
-                
-                context = await browser.new_context(**context_options)
-                
-                # Получаем список всех страниц (вкладок) в контексте
-                pages = context.pages
-                
-                # Если есть уже открытые страницы, используем первую (она успела загрузиться)
-                if pages:
-                    page = pages[0]
-                    logger.debug(f"  • Используем первую открытую страницу (всего открыто: {len(pages)})")
-                else:
-                    page = await context.new_page()
-                
+            # Создаем новую вкладку в существующем контексте (не открываем новое окно)
+            page = await self._playwright_context.new_page()
+            
+            try:
                 # Применяем stealth (если доступен)
                 try:
                     if callable(stealth):
@@ -490,67 +614,42 @@ class OzonCatalogAPI:
                 except:
                     pass
                 
-                # Сначала открываем страницу продавца для установки cookies
+                # Сначала открываем страницу продавца для установки cookies (только для первой страницы)
                 seller_page_url = f"https://www.ozon.ru/seller/{seller_name}-{seller_id}/"
                 
-                # Ждем полной загрузки страницы с проверкой готовности
-                logger.debug(f"  • Открываем страницу продавца: {seller_page_url}")
-                await page.goto(seller_page_url, wait_until='networkidle', timeout=60000)
+                if page_num == 1:
+                    logger.debug(f"  • Открываем страницу продавца: {seller_page_url}")
+                    await page.goto(seller_page_url, wait_until='networkidle', timeout=30000)
+                    await asyncio.sleep(1)  # Небольшая задержка для загрузки
                 
-                # Дополнительная проверка загрузки: ждем появления элементов или скриптов
-                try:
-                    # Ждем загрузки основного контента (проверяем наличие элементов каталога)
-                    await page.wait_for_load_state('domcontentloaded', timeout=10000)
-                    await page.wait_for_load_state('networkidle', timeout=10000)
-                    
-                    # Небольшая задержка для завершения всех асинхронных запросов
-                    await asyncio.sleep(1)
-                    
-                    # Проверяем, что страница действительно загрузилась
-                    page_ready = await page.evaluate('''() => {
-                        return document.readyState === 'complete' && 
-                               (window.jQuery === undefined || window.jQuery.active === 0);
-                    }''')
-                    
-                    if not page_ready:
-                        logger.debug(f"  • Страница еще загружается, ждем дополнительно...")
-                        await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    logger.debug(f"  • Предупреждение при проверке загрузки: {e}")
-                    # Продолжаем даже если проверка не прошла
-                
-                logger.debug(f"  • Страница продавца загружена, делаем запрос к API")
-                
-                # Теперь делаем запрос к API через Playwright
+                # Делаем запрос к API через Playwright
                 headers = {
                     'Accept': 'application/json, text/plain, */*',
                     'Referer': seller_page_url,
                     'Origin': 'https://www.ozon.ru'
                 }
                 
+                logger.debug(f"  • Запрос к API через вкладку (страница {page_num})")
                 response = await page.request.get(url, headers=headers)
                 
                 if response.status == 200:
                     try:
                         data = await response.json()
-                        await browser.close()
-                        logger.success(f"✅ Playwright fallback успешен: получен JSON ответ")
+                        logger.success(f"✅ Playwright запрос успешен: получен JSON ответ (страница {page_num})")
                         return data
                     except Exception as e:
                         logger.error(f"❌ Ошибка парсинга JSON из Playwright ответа: {e}")
-                        await browser.close()
                         return None
                 else:
-                    logger.warning(f"⚠️ Playwright fallback вернул статус {response.status}")
-                    await browser.close()
+                    logger.warning(f"⚠️ Playwright вернул статус {response.status} (страница {page_num})")
                     return None
                     
-        except ImportError:
-            logger.warning("⚠️ Playwright не установлен, fallback недоступен")
-            return None
+            finally:
+                # Закрываем вкладку (но не браузер)
+                await page.close()
+                    
         except Exception as e:
-            logger.error(f"❌ Ошибка при Playwright fallback: {e}")
+            logger.error(f"❌ Ошибка при Playwright запросе: {e}")
             logger.debug("Детали ошибки:", exc_info=True)
             return None
     
@@ -620,9 +719,27 @@ class OzonCatalogAPI:
         
         async with self.semaphore:
             try:
-                await asyncio.sleep(self.request_delay)
+                # Используем адаптивную задержку если включена, иначе фиксированную
+                delay = self.adaptive_delayer.get_delay() if self.adaptive_delayer else self.request_delay
+                await asyncio.sleep(delay)
                 
                 logger.debug(f"📥 Запрос страницы {page} для продавца {seller_id}...")
+                
+                # В FULL режиме используем только Playwright (curl_cffi всегда блокируется)
+                if self.mode == 'full':
+                    playwright_result = await self._fetch_page_via_playwright(url, seller_name, seller_id, page)
+                    if playwright_result:
+                        elapsed_time = time.time() - start_time
+                        logger.info(f"✅ Страница {page}: успешно загружена за {elapsed_time:.2f} сек.")
+                        return playwright_result
+                    else:
+                        logger.error(f"❌ Не удалось получить страницу {page} через Playwright")
+                        return None
+                
+                # LIGHT режим: пробуем curl_cffi (но он обычно блокируется)
+                if not self.session:
+                    logger.error("❌ curl_cffi сессия не инициализирована в LIGHT режиме")
+                    return None
                 
                 # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ: Cookies перед запросом
                 logger.debug(f"🔍 ДИАГНОСТИКА: Cookies перед запросом:")
@@ -759,6 +876,10 @@ class OzonCatalogAPI:
                 elapsed_time = time.time() - start_time
                 
                 if response.status_code == 200:
+                    # Успешный запрос - уведомляем адаптивный контроллер
+                    if self.adaptive_delayer:
+                        self.adaptive_delayer.on_success()
+                    
                     try:
                         data = response.json()
                         
@@ -786,6 +907,10 @@ class OzonCatalogAPI:
                     
                     if is_antibot_triggered:
                         self._antibot_triggered_count += 1
+                        # Уведомляем адаптивный контроллер о блокировке
+                        if self.adaptive_delayer:
+                            self.adaptive_delayer.on_block()
+                        
                         logger.error(
                             f"🚫 Ozon antibot активирован (попытка {retry_count + 1}/{self._antibot_triggered_count} всего)"
                         )
@@ -831,33 +956,15 @@ class OzonCatalogAPI:
                             f"  • Используйте headless=False для отладки"
                         )
                     
-                    # Первая попытка - пробуем fallback на Playwright (так как curl_cffi детектируется)
-                    if retry_count == 0:
-                        logger.warning(f"  • curl_cffi заблокирован антиботом, пробуем через Playwright...")
-                        # Используем Playwright для выполнения запроса (он успешно проходит антибот)
-                        playwright_result = await self._fetch_page_via_playwright(url, seller_name, seller_id)
-                        if playwright_result:
-                            logger.success(f"✅ Успешно получена страница {page} через Playwright (fallback)")
-                            return playwright_result
-                        
-                        # Если Playwright тоже не помог, пробуем обновить cookies
-                        logger.debug(f"  • Playwright fallback не помог, пробуем обновить cookies...")
-                        await self._initialize_session()
-                        await asyncio.sleep(5.0)
-                        return await self._fetch_page(seller_id, seller_name, page, 
-                                                      paginator_token, search_page_state, 
-                                                      retry_count + 1)
-                    else:
-                        # После второй попытки все еще 403 - выбрасываем исключение
-                        logger.error(
-                            f"❌ Forbidden (403) при запросе страницы {page} (после retry):\n"
-                            f"URL: {url}\n"
-                            f"Cookies в заголовке: {'ДА' if self._cookies_header else 'НЕТ'}\n"
-                            f"Cookies count: {len(self._cookies_dict)}\n"
-                            f"Cookies: {list(self._cookies_dict.keys())}\n"
-                            f"Proxy: {self.proxy if self.proxy else 'НЕ ИСПОЛЬЗУЕТСЯ'}"
-                        )
-                        return None
+                    # LIGHT режим - curl_cffi заблокирован, Playwright недоступен
+                    logger.error(
+                        f"❌ LIGHT режим: curl_cffi заблокирован, Playwright fallback недоступен. "
+                        f"Рекомендации:\n"
+                        f"  • Используйте cookies из файла (Cookies-as-a-Service)\n"
+                        f"  • Переключитесь на FULL режим (OZON_MODE=full)\n"
+                        f"  • Сделайте паузу 5-10 минут"
+                    )
+                    return None
                         
                 elif response.status_code == 429:
                     # Rate limiting
@@ -906,13 +1013,14 @@ class OzonCatalogAPI:
                 logger.exception("Детали исключения:")
                 return None
     
-    async def fetch_seller_catalog(self, seller_id: int, seller_name: str, max_pages: int = 100) -> List[Dict]:
+    async def fetch_seller_catalog(self, seller_id: int, seller_name: str, max_pages: int = 100, max_products: int = None) -> List[Dict]:
         """Получает весь каталог продавца (все страницы).
         
         Args:
             seller_id: ID продавца
             seller_name: Название продавца (из URL, например "cosmo-beauty")
             max_pages: Максимальное количество страниц (защита от бесконечного цикла)
+            max_products: Максимальное количество товаров (для тестового режима). Если None - без ограничений
         
         Returns:
             Список всех товаров из каталога
@@ -946,8 +1054,33 @@ class OzonCatalogAPI:
         
         # Парсим товары с первой страницы
         products = self.parse_products_from_page(first_page_data)
-        all_products.extend(products)
+        
+        # Проверяем лимит товаров для тестового режима
+        if max_products is not None:
+            all_products.extend(products[:max_products])
+            if len(products) > max_products:
+                logger.info(
+                    f"ℹ️ Добавлено {max_products} товаров с первой страницы (лимит). "
+                    f"Пропущено {len(products) - max_products} товаров"
+                )
+        else:
+            all_products.extend(products)
+        
         successful_pages += 1
+        
+        # Если достигнут лимит после первой страницы, прекращаем
+        if max_products is not None and len(all_products) >= max_products:
+            logger.info(
+                f"ℹ️ Достигнут лимит товаров ({max_products}) после первой страницы. "
+                f"Остановка загрузки."
+            )
+            catalog_time = time.time() - catalog_start_time
+            logger.success(
+                f"✅ Каталог продавца {seller_id} ({cabinet_name}) загружен: "
+                f"всего товаров {len(all_products)}, страниц успешно {successful_pages}, "
+                f"страниц с ошибками {failed_pages}, время загрузки {catalog_time:.2f} сек"
+            )
+            return all_products
         
         # Извлекаем параметры для следующей страницы
         # Пробуем разные варианты полей для пагинации
@@ -1122,7 +1255,30 @@ class OzonCatalogAPI:
                     break
                 
                 products = self.parse_products_from_page(page_data)
-                all_products.extend(products)
+                
+                # Проверяем лимит товаров для тестового режима
+                if max_products is not None and len(all_products) >= max_products:
+                    logger.info(
+                        f"ℹ️ Достигнут лимит товаров ({max_products}). "
+                        f"Остановка загрузки. Всего собрано: {len(all_products)}"
+                    )
+                    break
+                
+                # Добавляем товары с учетом лимита
+                if max_products is not None:
+                    remaining = max_products - len(all_products)
+                    if remaining > 0:
+                        all_products.extend(products[:remaining])
+                        if len(products) > remaining:
+                            logger.info(
+                                f"ℹ️ Добавлено {remaining} товаров (лимит {max_products}). "
+                                f"Пропущено {len(products) - remaining} товаров"
+                            )
+                    else:
+                        break
+                else:
+                    all_products.extend(products)
+                
                 successful_pages += 1
                 
                 logger.info(
@@ -1133,6 +1289,13 @@ class OzonCatalogAPI:
                 if not products:
                     # Если товаров нет, прекращаем
                     logger.info(f"ℹ️ Страница {page} пустая, прекращаем загрузку")
+                    break
+                
+                # Проверяем лимит после добавления
+                if max_products is not None and len(all_products) >= max_products:
+                    logger.info(
+                        f"ℹ️ Достигнут лимит товаров ({max_products}). Остановка загрузки."
+                    )
                     break
                 
                 # Ищем информацию о следующей странице в ответе
@@ -1307,6 +1470,47 @@ class OzonCatalogAPI:
             if not sku:
                 return None
             
+            # Пробуем извлечь offer_id из разных мест в структуре
+            offer_id = None
+            
+            # Вариант 1: Прямое поле в item
+            offer_id = item.get("offer_id") or item.get("offerId") or item.get("offer")
+            
+            # Вариант 2: В action/link (может быть в URL товара)
+            if not offer_id:
+                action = item.get("action", {})
+                link = action.get("link", "") if isinstance(action, dict) else ""
+                # Пробуем извлечь из URL товара (если там есть offer_id)
+                if link and "offer" in link.lower():
+                    import re
+                    # Ищем паттерны типа offer=XXX или offer_id=XXX
+                    offer_match = re.search(r'offer[_-]?id=([^&/?]+)', link, re.IGNORECASE)
+                    if offer_match:
+                        offer_id = offer_match.group(1)
+            
+            # Вариант 3: В multiButton или других вложенных структурах
+            if not offer_id:
+                multi_button = item.get("multiButton", {})
+                if isinstance(multi_button, dict):
+                    ozon_button = multi_button.get("ozonButton", {})
+                    if isinstance(ozon_button, dict):
+                        add_to_cart = ozon_button.get("addToCart", {})
+                        if isinstance(add_to_cart, dict):
+                            # Может быть в params или других полях
+                            params = add_to_cart.get("params", {})
+                            if isinstance(params, dict):
+                                offer_id = params.get("offer_id") or params.get("offerId")
+            
+            # Вариант 4: В trackingInfo или других метаданных
+            if not offer_id:
+                tracking_info = item.get("trackingInfo", {})
+                if isinstance(tracking_info, dict):
+                    # Может быть в ключах или значениях
+                    for key, value in tracking_info.items():
+                        if "offer" in key.lower() and value:
+                            offer_id = str(value)
+                            break
+            
             # Извлекаем название товара
             product_name = ""
             main_state = item.get("mainState", [])
@@ -1460,7 +1664,13 @@ class OzonCatalogAPI:
             elif original_price is None and current_price is None:
                 logger.debug(f"  ⚠️ SKU {sku}: нет ни одной цены")
             
-            return {
+            # Вычисляем скидку, если она не найдена, но есть обе цены
+            if discount_percent is None and current_price is not None and original_price is not None:
+                if original_price > 0 and original_price > current_price:
+                    discount_percent = round(((original_price - current_price) / original_price) * 100, 1)
+                    logger.debug(f"  ✓ SKU {sku}: скидка вычислена: {discount_percent}% ({original_price} → {current_price})")
+            
+            result = {
                 "sku": sku,
                 "product_name": product_name,
                 "current_price": current_price,
@@ -1468,6 +1678,16 @@ class OzonCatalogAPI:
                 "discount_percent": discount_percent,
                 "source": "catalog_api"
             }
+            
+            # Добавляем offer_id если нашли
+            if offer_id:
+                result["offer_id"] = offer_id
+                logger.debug(f"  ✓ SKU {sku}: найден offer_id={offer_id} в публичном API")
+            else:
+                # Логируем структуру item для диагностики (только для первого товара)
+                logger.debug(f"  ⚠️ SKU {sku}: offer_id не найден в публичном API. Доступные ключи: {list(item.keys())[:20]}")
+            
+            return result
             
         except Exception as e:
             logger.debug(f"Ошибка при парсинге товара: {e}")

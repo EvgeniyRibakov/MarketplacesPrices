@@ -54,6 +54,9 @@ class WBCatalogAPI:
         # Если переданы cookies, добавляем их в сессию
         if self.custom_cookies:
             await self._load_custom_cookies()
+        else:
+            # Если cookies не указаны, пытаемся получить автоматически из браузера
+            await self._try_auto_get_cookies()
         
         # Инициализируем сессию (получаем cookies через запросы к WB)
         await self._initialize_session()
@@ -153,6 +156,45 @@ class WBCatalogAPI:
             logger.exception("Детали ошибки:")
             self._cookies_header = None
     
+    async def _try_auto_get_cookies(self):
+        """Пытается автоматически получить cookies из браузера.
+        
+        Это fallback если cookies не указаны в .env.
+        Позволяет запускать проект без настройки cookies.
+        """
+        try:
+            import sys
+            from pathlib import Path
+            # Добавляем путь к корню проекта для импорта
+            project_root = Path(__file__).parent.parent.parent
+            if str(project_root) not in sys.path:
+                sys.path.insert(0, str(project_root))
+            
+            from src.utils.browser_cookies import get_wb_cookies
+            
+            logger.info("🔍 Cookies не указаны в .env, пытаемся получить автоматически из браузера...")
+            
+            # Получаем cookies (синхронная функция, но вызываем в executor)
+            loop = asyncio.get_event_loop()
+            cookies_string = await loop.run_in_executor(None, get_wb_cookies, True)
+            
+            if cookies_string:
+                self.custom_cookies = cookies_string
+                await self._load_custom_cookies()
+                logger.success("✅ Cookies успешно получены автоматически из браузера")
+            else:
+                logger.warning("⚠️ Не удалось получить cookies из браузера автоматически")
+                logger.info("💡 Продолжаем без cookies - curl_cffi попытается получить их через запросы")
+                logger.info("💡 Если будут ошибки 498, добавьте cookies в .env файл (см. README.md)")
+                
+        except ImportError as e:
+            logger.debug(f"Библиотеки для работы с браузером не установлены: {e}")
+            logger.info("💡 Продолжаем без cookies - curl_cffi попытается получить их через запросы")
+            logger.info("💡 Если будут ошибки 498, установите: python -m pip install undetected-chromedriver selenium")
+        except Exception as e:
+            logger.debug(f"Ошибка при автоматическом получении cookies: {e}")
+            logger.info("💡 Продолжаем без cookies - curl_cffi попытается получить их через запросы")
+    
     async def _initialize_session(self):
         """Инициализирует сессию через запрос к главной странице.
         
@@ -192,8 +234,26 @@ class WBCatalogAPI:
             cookies_before = len(self._cookies_dict)
             
             if hasattr(self.session, 'cookies'):
-                for cookie in self.session.cookies:
-                    self._cookies_dict[cookie.name] = cookie.value
+                try:
+                    # curl_cffi может возвращать cookies как словарь или как итерируемый объект
+                    if hasattr(self.session.cookies, 'get_dict'):
+                        # Если есть метод get_dict, используем его
+                        cookies_from_session = self.session.cookies.get_dict()
+                        self._cookies_dict.update(cookies_from_session)
+                    else:
+                        # Иначе итерируемся по cookies
+                        for cookie in self.session.cookies:
+                            # Проверяем тип: может быть объект cookie или строка
+                            if isinstance(cookie, str):
+                                # Если это строка, пропускаем (неправильный формат)
+                                continue
+                            elif hasattr(cookie, 'name') and hasattr(cookie, 'value'):
+                                self._cookies_dict[cookie.name] = cookie.value
+                            elif isinstance(cookie, tuple) and len(cookie) == 2:
+                                # Может быть кортеж (name, value)
+                                self._cookies_dict[cookie[0]] = cookie[1]
+                except Exception as e:
+                    logger.debug(f"Ошибка при синхронизации cookies из session.cookies в _initialize_session: {e}")
             
             # Также обновляем из response.cookies (даже при ошибке 498 могут быть cookies)
             if response.cookies:

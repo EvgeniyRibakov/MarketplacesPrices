@@ -1,0 +1,61 @@
+# Игнорируем ненужные файлы для Docker образа
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Виртуальные окружения
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи и временные файлы
+logs/
+*.log
+.cache/
+
+# Output файлы (будут созданы в контейнере)
+output/
+
+# Документация (не нужна в контейнере)
+docs/
+important_docs/
+*.md
+!README.md
+
+# Скрипты разработки
+scripts/
+tools/
+
+# Playwright браузеры (не нужны для LIGHT режима)
+.playwright/
+
+# Тесты
+tests/
+test_*.py
+*_test.py
+
+# Конфигурация разработки
+.env
+.env.local
+.env.*.local
+
+# Другие
+.DS_Store
+Thumbs.db

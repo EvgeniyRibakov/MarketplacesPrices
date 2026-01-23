@@ -1,0 +1,31 @@
+# Fly.io конфигурация для деплоя парсера Ozon
+
+app = "ozon-parser"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  OZON_MODE = "light"
+  PYTHONUNBUFFERED = "1"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+# Переменные окружения установите через:
+# fly secrets set OZON_CLIENT_ID=your_client_id
+# fly secrets set OZON_API_KEY=your_api_key
+# fly secrets set OZON_SELLER_ID_COSMO=176640
+# fly secrets set OZON_SELLER_NAME_COSMO=cosmo-beauty
+# fly secrets set OZON_ACCOUNT_TYPE=foreign

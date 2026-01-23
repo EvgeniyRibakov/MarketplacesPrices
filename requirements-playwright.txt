@@ -1,0 +1,9 @@
+# Зависимости для Playwright (только для FULL режима)
+# Используется для получения cookies локально и fallback при блокировках
+
+playwright>=1.40.0
+playwright-stealth>=1.0.6
+
+# Дополнительные браузерные инструменты (для получения cookies из браузера)
+undetected-chromedriver>=3.5.0
+selenium>=4.15.0

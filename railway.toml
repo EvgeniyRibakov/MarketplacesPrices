@@ -1,0 +1,21 @@
+# Railway конфигурация для деплоя парсера Ozon
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python parse_ozon_sellers.py"
+healthcheckPath = "/"
+healthcheckTimeout = 100
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# Переменные окружения (установите в Railway dashboard)
+# OZON_CLIENT_ID=your_client_id
+# OZON_API_KEY=your_api_key
+# OZON_SELLER_ID_COSMO=176640
+# OZON_SELLER_NAME_COSMO=cosmo-beauty
+# OZON_MODE=light
+# OZON_ACCOUNT_TYPE=foreign
+# OZON_COOKIES_PATH=cookies/ozon_cookies.json

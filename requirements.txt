@@ -1,11 +1,12 @@
-aiohttp>=3.9.0
-curl-cffi>=0.5.0
-loguru>=0.7.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-python-dotenv>=1.0.0
-undetected-chromedriver>=3.5.0
-selenium>=4.15.0
-playwright>=1.40.0
-playwright-stealth>=1.0.6
-pywin32>=306; sys_platform == "win32"
+# Основной файл requirements.txt для совместимости
+# Рекомендуется использовать раздельные файлы:
+# - requirements-core.txt (для LIGHT режима, хостинг)
+# - requirements-playwright.txt (для FULL режима, локальный ПК)
+# - requirements-dev.txt (для разработки)
+
+# Основные зависимости (всегда нужны)
+-r requirements-core.txt
+
+# Playwright зависимости (только для FULL режима)
+# Раскомментируйте если нужен Playwright:
+# -r requirements-playwright.txt

@@ -171,12 +171,16 @@ def export_results(results: List[Dict], output_dir: Path):
             'cabinet_id': 'ID кабинета',
             'cabinet_name': 'Кабинет',
             'price_current': 'Цена покупателя',
-            'price_original': 'Зачёркнутая цена (каталог)',
             'discount_percent': 'Скидка %',
             'price_seller': 'Цена продавца',
             'price_old': 'Зачёркнутая цена (API)',
-            'price_min': 'Минимальная цена',
         }
+        
+        # Удаляем ненужные столбцы перед переименованием
+        columns_to_remove_before = ['price_original', 'price_min']
+        for col in columns_to_remove_before:
+            if col in df.columns:
+                df = df.drop(columns=[col])
         
         for old_name, new_name in rename_mapping.items():
             if old_name in df.columns:
@@ -196,11 +200,10 @@ def export_results(results: List[Dict], output_dir: Path):
             'ID кабинета',
             'Кабинет',
             'Цена покупателя',
-            'Зачёркнутая цена (каталог)',
             'Скидка %',
             'Цена продавца',
             'Зачёркнутая цена (API)',
-            'Минимальная цена',
+            'product_id_seller',
         ]
         
         # Оставляем только существующие столбцы в нужном порядке
@@ -254,10 +257,10 @@ def export_results(results: List[Dict], output_dir: Path):
                 f"({filled/len(df)*100:.1f}%)"
             )
         
-        if 'Зачёркнутая цена (каталог)' in df.columns:
-            filled = df['Зачёркнутая цена (каталог)'].notna().sum()
+        if 'Зачёркнутая цена (API)' in df.columns:
+            filled = df['Зачёркнутая цена (API)'].notna().sum()
             logger.info(
-                f"💰 Заполнено зачёркнутых цен (каталог): {filled} из {len(df)} "
+                f"💰 Заполнено зачёркнутых цен (API): {filled} из {len(df)} "
                 f"({filled/len(df)*100:.1f}%)"
             )
         
