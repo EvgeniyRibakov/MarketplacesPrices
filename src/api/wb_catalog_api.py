@@ -959,3 +959,190 @@ class WBCatalogAPI:
         )
         
         return all_results
+    
+    async def fetch_stocks_count(self, nm_ids: List[int]) -> Dict[int, any]:
+        """Получает stockCount для списка артикулов через seller-analytics-api.
+        
+        Args:
+            nm_ids: Список артикулов (nmID) товаров
+        
+        Returns:
+            Словарь {nm_id: stockCount} (int) или {nm_id: "N/A"} (str) если не найдено
+        """
+        if not nm_ids:
+            return {}
+        
+        STOCKS_API_URL = "https://seller-analytics-api.wildberries.ru/api/v2/stocks-report/products/products"
+        
+        # Проверяем наличие токена
+        if not self.discounts_api_token:
+            logger.warning("⚠️ Токен для Analytics API не указан, пропускаем получение остатков")
+            return {nm_id: "N/A" for nm_id in nm_ids}
+        
+        # Получаем сегодняшнюю дату в формате YYYY-MM-DD
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        # Формируем тело запроса
+        request_body = {
+            "nmIDs": nm_ids,
+            "currentPeriod": {
+                "start": today,
+                "end": today
+            },
+            "stockType": "",  # Все склады
+            "skipDeletedNm": True,
+            "orderBy": {
+                "field": "avgOrders",
+                "mode": "asc"
+            },
+            "availabilityFilters": [],  # Без фильтров
+            "limit": 1000,
+            "offset": 0
+        }
+        
+        all_results = {}
+        
+        try:
+            async with self.semaphore:
+                start_time = time.time()
+                
+                # Формируем заголовки
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.discounts_api_token}"
+                }
+                
+                logger.debug(
+                    f"📦 Запрос stockCount для {len(nm_ids)} артикулов "
+                    f"(период: {today})..."
+                )
+                
+                response = await self.session.post(
+                    STOCKS_API_URL,
+                    json=request_body,
+                    headers=headers,
+                    timeout=30
+                )
+                
+                elapsed_time = time.time() - start_time
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        
+                        # Парсим ответ и извлекаем stockCount из metrics
+                        # ВАЖНО: данные находятся в data.items, а не data.products!
+                        items = data.get("data", {}).get("items", [])
+                        
+                        if not items:
+                            # Пробуем альтернативный путь (на случай если структура изменится)
+                            items = data.get("data", {}).get("products", [])
+                        
+                        for item in items:
+                            nm_id = item.get("nmID")
+                            if not nm_id:
+                                continue
+                            
+                            # Извлекаем stockCount из metrics
+                            metrics = item.get("metrics", {})
+                            stock_count = metrics.get("stockCount")
+                            
+                            if stock_count is not None:
+                                all_results[nm_id] = stock_count
+                            else:
+                                all_results[nm_id] = "N/A"
+                                logger.debug(f"  • Товар {nm_id}: stockCount отсутствует в metrics")
+                        
+                        # Для товаров, которых нет в ответе, ставим "N/A"
+                        found_nm_ids = set(all_results.keys())
+                        missing_nm_ids = set(nm_ids) - found_nm_ids
+                        
+                        if missing_nm_ids:
+                            logger.warning(
+                                f"⚠️ {len(missing_nm_ids)} товаров не найдено в ответе stocks API "
+                                f"(примеры: {list(missing_nm_ids)[:5]})"
+                            )
+                            for nm_id in missing_nm_ids:
+                                all_results[nm_id] = "N/A"
+                        
+                        logger.success(
+                            f"✅ Получено stockCount для {len(found_nm_ids)} товаров "
+                            f"из {len(nm_ids)} запрошенных за {elapsed_time:.2f} сек"
+                        )
+                        
+                    except Exception as e:
+                        logger.error(
+                            f"❌ Ошибка парсинга JSON ответа stocks API "
+                            f"(время: {elapsed_time:.2f} сек): {e}"
+                        )
+                        logger.exception("Детали ошибки:")
+                        # Возвращаем "N/A" для всех товаров при ошибке парсинга
+                        all_results = {nm_id: "N/A" for nm_id in nm_ids}
+                
+                elif response.status_code == 401:
+                    logger.error(
+                        f"❌ Ошибка авторизации (401) при запросе stocks API: "
+                        f"неверный токен или токен истек"
+                    )
+                    all_results = {nm_id: "N/A" for nm_id in nm_ids}
+                
+                elif response.status_code == 429:
+                    logger.warning(
+                        f"⚠️ Rate limit (429) для stocks API "
+                        f"(время: {elapsed_time:.2f} сек). Ожидание 20 сек..."
+                    )
+                    await asyncio.sleep(20)  # Rate limit: 3 запроса в минуту, интервал 20 сек
+                    # Повторяем запрос один раз
+                    try:
+                        response = await self.session.post(
+                            STOCKS_API_URL,
+                            json=request_body,
+                            headers=headers,
+                            timeout=30
+                        )
+                        if response.status_code == 200:
+                            data = response.json()
+                            items = data.get("data", {}).get("items", [])
+                            if not items:
+                                items = data.get("data", {}).get("products", [])
+                            for item in items:
+                                nm_id = item.get("nmID")
+                                if nm_id:
+                                    metrics = item.get("metrics", {})
+                                    stock_count = metrics.get("stockCount")
+                                    all_results[nm_id] = stock_count if stock_count is not None else "N/A"
+                            found_nm_ids = set(all_results.keys())
+                            missing_nm_ids = set(nm_ids) - found_nm_ids
+                            for nm_id in missing_nm_ids:
+                                all_results[nm_id] = "N/A"
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка при повторном запросе stocks API: {e}")
+                        all_results = {nm_id: "N/A" for nm_id in nm_ids}
+                
+                else:
+                    logger.error(
+                        f"❌ Ошибка запроса stocks API: статус {response.status_code} "
+                        f"(время: {elapsed_time:.2f} сек)"
+                    )
+                    try:
+                        error_text = response.text[:200]
+                        logger.debug(f"Ответ сервера: {error_text}")
+                    except:
+                        pass
+                    all_results = {nm_id: "N/A" for nm_id in nm_ids}
+                
+        except asyncio.TimeoutError:
+            logger.error(
+                f"❌ Таймаут при запросе stocks API "
+                f"(время ожидания: 30 сек)"
+            )
+            all_results = {nm_id: "N/A" for nm_id in nm_ids}
+        except Exception as e:
+            logger.error(
+                f"❌ Исключение при запросе stocks API: {e}"
+            )
+            logger.exception("Детали исключения:")
+            all_results = {nm_id: "N/A" for nm_id in nm_ids}
+        
+        return all_results

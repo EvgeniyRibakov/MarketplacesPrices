@@ -325,6 +325,217 @@ async def fetch_discounted_prices_for_results(results: List[Dict],
     return results
 
 
+async def fetch_stocks_for_results(results: List[Dict],
+                                  cookies: Optional[str] = None,
+                                  discounts_api_token: Optional[str] = None,
+                                  discounts_tokens_by_cabinet: Optional[Dict[str, str]] = None) -> Dict[int, any]:
+    """Получает stockCount для всех товаров из результатов парсинга.
+    
+    Args:
+        results: Список результатов парсинга с полем product_id
+        cookies: Опциональные cookies для запросов
+        discounts_api_token: Токен для авторизации в Analytics API (используется тот же, что для discounts)
+        discounts_tokens_by_cabinet: Токены по кабинетам для Analytics API
+    
+    Returns:
+        Словарь {product_id: stockCount} или {product_id: "N/A"}
+    """
+    import time
+    from src.api.wb_catalog_api import WBCatalogAPI
+    
+    if not results:
+        return results
+    
+    logger.info("\n" + "=" * 70)
+    logger.info("📦 Получение остатков на складе (stockCount) через Analytics API")
+    logger.info("=" * 70)
+    
+    fetch_start_time = time.time()
+    
+    # Собираем уникальные product_id и группируем по кабинетам
+    product_ids = set()
+    product_ids_by_cabinet = {}
+    
+    for result in results:
+        product_id = result.get("product_id")
+        cabinet_name = result.get("cabinet_name", "Unknown")
+        
+        if product_id:
+            product_ids.add(product_id)
+            if cabinet_name not in product_ids_by_cabinet:
+                product_ids_by_cabinet[cabinet_name] = []
+            product_ids_by_cabinet[cabinet_name].append(product_id)
+    
+    logger.info(f"📊 Найдено уникальных товаров: {len(product_ids)}")
+    
+    # Логируем распределение по кабинетам
+    for cabinet_name, ids in product_ids_by_cabinet.items():
+        logger.info(f"  • {cabinet_name}: {len(ids)} товаров")
+    
+    if not product_ids:
+        logger.warning("⚠️ Не найдено product_id в результатах")
+        return {}
+    
+    # Проверяем наличие токенов
+    if not discounts_api_token and not (discounts_tokens_by_cabinet and discounts_tokens_by_cabinet):
+        logger.warning(
+            "⚠️ Токен для Analytics API не найден в .env файле. "
+            "Запросы к stocks API будут пропущены. "
+            "Добавьте токен в .env: WB_DISCOUNTS_API_TOKEN=your_token "
+            "или WB_DISCOUNTS_API_TOKEN_COSMO, WB_DISCOUNTS_API_TOKEN_BEAUTYLAB и т.д."
+        )
+        # Возвращаем "N/A" для всех товаров
+        return {product_id: "N/A" for product_id in product_ids}
+    
+    # Если есть токены по кабинетам, делаем отдельные запросы для каждого кабинета
+    if discounts_tokens_by_cabinet:
+        logger.info("🔑 Используются токены по кабинетам для запросов к stocks API")
+        all_stocks = {}
+        
+        # Группируем товары по кабинетам
+        products_by_cabinet = {}
+        for result in results:
+            cabinet_name = result.get("cabinet_name", "Unknown")
+            product_id = result.get("product_id")
+            if product_id:
+                if cabinet_name not in products_by_cabinet:
+                    products_by_cabinet[cabinet_name] = []
+                products_by_cabinet[cabinet_name].append(product_id)
+        
+        # Делаем запросы для каждого кабинета с соответствующим токеном
+        for cabinet_name, product_ids_list in products_by_cabinet.items():
+            cabinet_token = discounts_tokens_by_cabinet.get(cabinet_name)
+            
+            if not cabinet_token:
+                # Fallback на общий токен, если нет токена для кабинета
+                cabinet_token = discounts_api_token
+                if not cabinet_token:
+                    logger.warning(
+                        f"⚠️ Нет токена для кабинета {cabinet_name}, пропускаем {len(product_ids_list)} товаров"
+                    )
+                    continue
+            
+            unique_ids = list(set(product_ids_list))
+            logger.info(
+                f"📦 Запрос stockCount для кабинета {cabinet_name}: "
+                f"{len(unique_ids)} уникальных товаров"
+            )
+            
+            async with WBCatalogAPI(
+                request_delay=0.1,
+                max_concurrent=3,  # Rate limit: 3 запроса в минуту
+                cookies=cookies,
+                discounts_api_token=cabinet_token
+            ) as api:
+                cabinet_stocks = await api.fetch_stocks_count(unique_ids)
+                all_stocks.update(cabinet_stocks)
+        
+        stocks = all_stocks
+    else:
+        # Используем общий токен для всех товаров
+        async with WBCatalogAPI(
+            request_delay=0.1,
+            max_concurrent=3,  # Rate limit: 3 запроса в минуту
+            cookies=cookies,
+            discounts_api_token=discounts_api_token
+        ) as api:
+            stocks = await api.fetch_stocks_count(list(product_ids))
+    
+    fetch_time = time.time() - fetch_start_time
+    
+    # Статистика по успешным/неуспешным запросам
+    successful_count = sum(1 for v in stocks.values() if v != "N/A")
+    failed_count = len(stocks) - successful_count
+    
+    logger.info(
+        f"✅ Получено stockCount для {successful_count} товаров, "
+        f"не найдено: {failed_count} за {fetch_time:.2f} сек"
+    )
+    
+    # Анализируем, какие кабинеты получили данные
+    found_by_cabinet = {}
+    for result in results:
+        product_id = result.get("product_id")
+        cabinet_name = result.get("cabinet_name", "Unknown")
+        if product_id and product_id in stocks and stocks[product_id] != "N/A":
+            if cabinet_name not in found_by_cabinet:
+                found_by_cabinet[cabinet_name] = 0
+            found_by_cabinet[cabinet_name] += 1
+    
+    if found_by_cabinet:
+        logger.info("📊 Получено данных по кабинетам:")
+        for cabinet_name, count in found_by_cabinet.items():
+            total = len(product_ids_by_cabinet.get(cabinet_name, []))
+            logger.info(f"  • {cabinet_name}: {count} из {total} товаров ({count/total*100:.1f}%)")
+    
+    # Анализируем результаты и логируем статистику
+    successful_count = sum(1 for v in stocks.values() if v != "N/A")
+    failed_count = len(stocks) - successful_count
+    
+    # Логируем каждые 100 товаров (если товаров больше 100)
+    if len(stocks) > 100:
+        log_interval = 100
+        processed_count = 0
+        successful_batch = 0
+        failed_batch = 0
+        not_found_products_batch = []
+        
+        for product_id, stock_count in stocks.items():
+            if stock_count != "N/A":
+                successful_batch += 1
+            else:
+                failed_batch += 1
+                not_found_products_batch.append(product_id)
+            
+            processed_count += 1
+            
+            # Логируем каждые 100 товаров
+            if processed_count % log_interval == 0:
+                logger.info(
+                    f"📊 Обработано {processed_count} товаров: "
+                    f"успешно {successful_batch}, неуспешно {failed_batch}"
+                )
+                # Логируем примеры неуспешных товаров
+                if failed_batch > 0 and len(not_found_products_batch) > 0:
+                    examples = not_found_products_batch[-min(5, failed_batch):]
+                    logger.debug(
+                        f"  Примеры неуспешных товаров (артикулы): {', '.join(map(str, examples))}"
+                    )
+                    # Сбрасываем счетчики для следующего батча
+                    successful_batch = 0
+                    failed_batch = 0
+                    not_found_products_batch = []
+        
+        # Финальная статистика
+        logger.info(
+            f"📊 Итого обработано {processed_count} товаров: "
+            f"успешно {successful_count}, неуспешно {failed_count}"
+        )
+    else:
+        # Если товаров меньше 100, просто логируем итоговую статистику
+        logger.info(
+            f"📊 Обработано {len(stocks)} товаров: "
+            f"успешно {successful_count}, неуспешно {failed_count}"
+        )
+    
+    # Логируем неуспешные товары в конце
+    not_found_products = [pid for pid, count in stocks.items() if count == "N/A"]
+    if not_found_products:
+        logger.warning(
+            f"⚠️ Не найдено stockCount для {len(not_found_products)} товаров"
+        )
+        # Логируем первые 10 примеров
+        examples = not_found_products[:10]
+        for product_id in examples:
+            logger.debug(f"  • Артикул {product_id}: stockCount не найден")
+        if len(not_found_products) > 10:
+            logger.debug(f"  ... и еще {len(not_found_products) - 10} товаров")
+    
+    logger.info(f"✅ Получено stockCount для {successful_count} товаров")
+    
+    return stocks
+
+
 async def parse_all_sellers():
     """Парсит всех продавцов из конфигурации кабинетов."""
     import time
@@ -421,16 +632,44 @@ async def parse_all_sellers():
             logger.exception("Детали ошибки:")
             continue
     
-    # Получаем discountedPrice для всех товаров
+    # Получаем discountedPrice и stockCount для всех товаров параллельно
     if all_results:
         discounts_api_token = env_config.get("discounts_api_token")
         discounts_tokens_by_cabinet = env_config.get("discounts_tokens_by_cabinet", {})
-        all_results = await fetch_discounted_prices_for_results(
-            all_results,
-            cookies=cookies,
-            discounts_api_token=discounts_api_token,
-            discounts_tokens_by_cabinet=discounts_tokens_by_cabinet
+        
+        # Запускаем оба запроса параллельно
+        logger.info("🔄 Запускаем параллельные запросы к discounts API и stocks API...")
+        all_results, stocks_dict = await asyncio.gather(
+            fetch_discounted_prices_for_results(
+                all_results,
+                cookies=cookies,
+                discounts_api_token=discounts_api_token,
+                discounts_tokens_by_cabinet=discounts_tokens_by_cabinet
+            ),
+            fetch_stocks_for_results(
+                all_results,  # Передаем для получения списка product_id
+                cookies=cookies,
+                discounts_api_token=discounts_api_token,
+                discounts_tokens_by_cabinet=discounts_tokens_by_cabinet
+            ),
+            return_exceptions=True
         )
+        
+        # Если fetch_stocks_for_results вернул исключение, обрабатываем его
+        if isinstance(stocks_dict, Exception):
+            logger.error(f"❌ Ошибка при получении остатков: {stocks_dict}")
+            logger.exception("Детали ошибки:")
+            # Устанавливаем "N/A" для всех товаров при ошибке
+            for result in all_results:
+                result["stockCount"] = "N/A"
+        else:
+            # Добавляем stockCount к результатам
+            for result in all_results:
+                product_id = result.get("product_id")
+                if product_id and product_id in stocks_dict:
+                    result["stockCount"] = stocks_dict[product_id]
+                else:
+                    result["stockCount"] = "N/A"
     
     total_time = time.time() - total_start_time
     
@@ -478,7 +717,8 @@ def export_results(results: List[Dict], output_dir: Path):
             'price_before_spp': 'Цена до СПП',
             'product_id': 'Артикул',
             'price_basic': 'Зачёркнутая цена',
-            'price_product': 'Цена с СПП'
+            'price_product': 'Цена с СПП',
+            'stockCount': 'Остатки всего'
         }
         
         for old_name, new_name in rename_mapping.items():
@@ -550,7 +790,8 @@ def export_results(results: List[Dict], output_dir: Path):
             'Цена до СПП',
             'Цена с СПП',
             'Цена с картой 10%',
-            'Процент СПП'
+            'Процент СПП',
+            'Остатки всего'
         ]
         
         # Оставляем только существующие столбцы в нужном порядке
