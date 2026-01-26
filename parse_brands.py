@@ -555,9 +555,13 @@ async def parse_all_sellers():
     env_config = load_env_config()
     config_time = time.time() - config_start
     
-    # Парсим только COSMO и BEAUTYLAB
+    # Парсим все 6 кабинетов
     suppliers = [
+        53607,    # MAU
+        121614,   # MAB
+        174711,   # MMA
         224650,   # COSMO
+        1140223,  # DREAMLAB
         4428365   # BEAUTYLAB
     ]
     
