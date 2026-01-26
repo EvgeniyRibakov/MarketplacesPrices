@@ -1,13 +1,14 @@
-"""Парсер для получения актуальных артикулов и названий товаров по всем 6 кабинетам WB.
+"""Парсер для получения ВСЕХ полей карточек товаров по всем 6 кабинетам WB (для отладки).
 
 Использует официальное API: POST https://content-api.wildberries.ru/content/v2/get/cards/list
-Сохраняет результаты в Articles.xlsx
+Сохраняет ВСЕ поля в Excel файл для анализа структуры данных.
 """
 import asyncio
 import os
 import sys
+import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from datetime import datetime
 
 project_root = Path(__file__).parent
@@ -40,9 +41,6 @@ CABINET_MAPPING = {
     "BEAUTYLAB": 4428365
 }
 
-# Обратный маппинг ID -> название
-CABINET_ID_TO_NAME = {v: k for k, v in CABINET_MAPPING.items()}
-
 
 async def get_cabinet_cards(api_token: str, cabinet_name: str, limit: int = 100) -> List[Dict]:
     """Получает список карточек товаров для кабинета через официальное API.
@@ -53,7 +51,7 @@ async def get_cabinet_cards(api_token: str, cabinet_name: str, limit: int = 100)
         limit: Количество товаров за запрос (максимум 100)
     
     Returns:
-        Список карточек товаров с nm_id и названиями
+        Список карточек товаров со всеми полями
     """
     url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
     
@@ -109,10 +107,6 @@ async def get_cabinet_cards(api_token: str, cabinet_name: str, limit: int = 100)
                 all_cards.extend(cards)
                 logger.info(f"✅ Получено {len(cards)} карточек для {cabinet_name} (всего: {len(all_cards)})")
                 
-                # Проверяем, есть ли еще данные для пагинации
-                cursor_data = data.get("cursor", {})
-                total = cursor_data.get("total", 0)
-                
                 # Если получили меньше limit, значит это последняя страница
                 if len(cards) < limit:
                     break
@@ -125,7 +119,6 @@ async def get_cabinet_cards(api_token: str, cabinet_name: str, limit: int = 100)
                         "nmID": last_card.get("nmID")
                     }
                 else:
-                    # Если нет карточек, прекращаем пагинацию
                     break
                 
                 # Соблюдаем rate limits (600мс между запросами)
@@ -139,24 +132,124 @@ async def get_cabinet_cards(api_token: str, cabinet_name: str, limit: int = 100)
     return all_cards
 
 
+def flatten_card(card: Dict, cabinet_name: str, cabinet_id: int) -> Dict:
+    """Преобразует карточку товара в плоскую структуру для Excel.
+    
+    Args:
+        card: Карточка товара из API
+        cabinet_name: Название кабинета
+        cabinet_id: ID кабинета
+    
+    Returns:
+        Словарь с плоской структурой всех полей
+    """
+    result = {
+        "cabinet_name": cabinet_name,
+        "cabinet_id": cabinet_id,
+    }
+    
+    # Простые поля (строки, числа, булевы значения)
+    simple_fields = [
+        "nmID", "imtID", "nmUUID", "subjectID", "subjectName", 
+        "vendorCode", "brand", "title", "description", "needKiz",
+        "video", "createdAt", "updatedAt"
+    ]
+    
+    for field in simple_fields:
+        value = card.get(field)
+        if value is not None:
+            # Преобразуем сложные типы в строки для Excel
+            if isinstance(value, (dict, list)):
+                result[field] = json.dumps(value, ensure_ascii=False)
+            else:
+                result[field] = value
+    
+    # Обрабатываем вложенные объекты
+    # photos - массив
+    photos = card.get("photos", [])
+    if photos:
+        result["photos_count"] = len(photos)
+        result["photos"] = json.dumps(photos, ensure_ascii=False)
+    else:
+        result["photos_count"] = 0
+        result["photos"] = ""
+    
+    # wholesale - объект
+    wholesale = card.get("wholesale", {})
+    if wholesale:
+        result["wholesale"] = json.dumps(wholesale, ensure_ascii=False)
+    else:
+        result["wholesale"] = ""
+    
+    # dimensions - объект
+    dimensions = card.get("dimensions", {})
+    if dimensions:
+        result["dimensions"] = json.dumps(dimensions, ensure_ascii=False)
+    else:
+        result["dimensions"] = ""
+    
+    # characteristics - массив объектов
+    characteristics = card.get("characteristics", [])
+    if characteristics:
+        result["characteristics_count"] = len(characteristics)
+        result["characteristics"] = json.dumps(characteristics, ensure_ascii=False)
+    else:
+        result["characteristics_count"] = 0
+        result["characteristics"] = ""
+    
+    # sizes - массив объектов (ВАЖНО для проверки наличия)
+    sizes = card.get("sizes", [])
+    if sizes:
+        result["sizes_count"] = len(sizes)
+        result["sizes"] = json.dumps(sizes, ensure_ascii=False)
+        
+        # Извлекаем информацию о размерах для анализа
+        sizes_info = []
+        for size in sizes:
+            size_info = {
+                "chrtID": size.get("chrtID"),
+                "techSize": size.get("techSize"),
+                "wbSize": size.get("wbSize"),
+                "skus": size.get("skus", []),
+                "price": size.get("price"),
+                "discountedPrice": size.get("discountedPrice"),
+            }
+            sizes_info.append(size_info)
+        result["sizes_details"] = json.dumps(sizes_info, ensure_ascii=False)
+    else:
+        result["sizes_count"] = 0
+        result["sizes"] = ""
+        result["sizes_details"] = ""
+    
+    # tags - массив
+    tags = card.get("tags", [])
+    if tags:
+        result["tags_count"] = len(tags)
+        result["tags"] = json.dumps(tags, ensure_ascii=False)
+    else:
+        result["tags_count"] = 0
+        result["tags"] = ""
+    
+    # Добавляем все остальные поля, которые могут быть в карточке
+    for key, value in card.items():
+        if key not in result and key not in ["photos", "wholesale", "dimensions", "characteristics", "sizes", "tags"]:
+            if isinstance(value, (dict, list)):
+                result[f"_{key}"] = json.dumps(value, ensure_ascii=False)
+            else:
+                result[f"_{key}"] = value
+    
+    return result
+
+
 async def parse_cabinet_articles(api_token: str, cabinet_name: str) -> List[Dict]:
-    """Парсит артикулы и названия товаров для одного кабинета через официальное API.
+    """Парсит все поля карточек товаров для одного кабинета через официальное API.
     
     Args:
         api_token: API токен продавца (с доступом к разделу "Контент")
         cabinet_name: Название кабинета (MAU, MAB, MMA, COSMO, DREAMLAB, BEAUTYLAB)
     
     Returns:
-        Список словарей с артикулами и названиями товаров:
-        [
-            {
-                "nm_id": 12345678,
-                "product_name": "Название товара",
-                "cabinet_id": 224650,
-                "cabinet_name": "COSMO"
-            },
-            ...
-        ]
+        Список словарей со всеми полями карточек
     """
     cabinet_id = CABINET_MAPPING.get(cabinet_name)
     if not cabinet_id:
@@ -165,7 +258,7 @@ async def parse_cabinet_articles(api_token: str, cabinet_name: str) -> List[Dict
     
     logger.info(f"🚀 Начинаем парсинг кабинета {cabinet_name} (ID: {cabinet_id})...")
     
-    articles = []
+    all_cards_flat = []
     
     try:
         # Получаем все карточки товаров через официальное API
@@ -173,88 +266,20 @@ async def parse_cabinet_articles(api_token: str, cabinet_name: str) -> List[Dict
         
         logger.info(f"📦 Получено {len(cards)} карточек из кабинета {cabinet_name}")
         
-        # Логируем структуру первой карточки для отладки (только один раз)
-        if cards and logger.level("DEBUG"):
-            first_card_keys = list(cards[0].keys())[:20]  # Первые 20 ключей
-            logger.debug(f"🔍 Структура карточки (первые 20 полей): {first_card_keys}")
-            if "sizes" in cards[0]:
-                sizes_sample = cards[0].get("sizes", [])[:2] if cards[0].get("sizes") else []
-                logger.debug(f"🔍 Пример sizes (первые 2): {sizes_sample}")
-        
-        # Извлекаем артикулы и названия
-        skipped_no_stock = 0
+        # Преобразуем каждую карточку в плоскую структуру
         for card in cards:
-            nm_id = card.get("nmID") or card.get("nmId")  # Артикул товара
-            
-            if not nm_id:
-                logger.warning(f"⚠️ Карточка без артикула (nmID) в кабинете {cabinet_name}")
-                continue
-            
-            # Извлекаем название товара: title (название товара)
-            product_name = card.get("title") or ""  # Название товара
-            
-            # Fallback на другие поля, если title отсутствует
-            if not product_name:
-                product_name = card.get("subjectName") or card.get("imtName") or ""
-            
-            # Проверяем наличие товара через поле sizes
-            # Товар считается в наличии, если есть хотя бы один размер с валидным chrtID
-            sizes = card.get("sizes", [])
-            has_stock = False
-            
-            if sizes and isinstance(sizes, list) and len(sizes) > 0:
-                # Проверяем каждый размер
-                for size in sizes:
-                    if not isinstance(size, dict):
-                        continue
-                    
-                    # chrtID - это ID размера, если он есть и больше 0, размер активен
-                    chrt_id = size.get("chrtID")
-                    
-                    # Проверяем chrtID: должен быть числом > 0
-                    if chrt_id is not None:
-                        try:
-                            chrt_id_int = int(chrt_id)
-                            # chrtID > 0 означает активный размер
-                            if chrt_id_int > 0:
-                                has_stock = True
-                                break
-                        except (ValueError, TypeError):
-                            # Если не удалось преобразовать в число, проверяем другие поля
-                            pass
-                    
-                    # Альтернативная проверка: если есть techSize или skus, размер может быть активным
-                    if not has_stock:
-                        tech_size = size.get("techSize")
-                        skus = size.get("skus", [])
-                        # Если есть techSize (не пустой) или есть SKU, считаем размер активным
-                        if (tech_size and str(tech_size).strip()) or (skus and len(skus) > 0):
-                            has_stock = True
-                            break
-            
-            # Пропускаем товары без наличия
-            if not has_stock:
-                skipped_no_stock += 1
-                logger.debug(f"⏭️ Товар {nm_id} ({product_name[:50] if product_name else 'без названия'}) пропущен - нет активных размеров (sizes: {len(sizes) if sizes else 0})")
-                continue
-            
-            articles.append({
-                "nm_id": nm_id,
-                "product_name": product_name,  # Используем title как название товара
-                "cabinet_id": cabinet_id,
-                "cabinet_name": cabinet_name
-            })
+            flat_card = flatten_card(card, cabinet_name, cabinet_id)
+            all_cards_flat.append(flat_card)
         
         logger.success(
-            f"✅ Кабинет {cabinet_name}: получено {len(articles)} артикулов "
-            f"из {len(cards)} карточек (пропущено без наличия: {skipped_no_stock})"
+            f"✅ Кабинет {cabinet_name}: обработано {len(all_cards_flat)} карточек"
         )
     
     except Exception as e:
         logger.error(f"❌ Ошибка при парсинге кабинета {cabinet_name}: {e}")
         logger.exception("Детали ошибки:")
     
-    return articles
+    return all_cards_flat
 
 
 def get_api_tokens() -> Dict[str, str]:
@@ -290,10 +315,10 @@ def get_api_tokens() -> Dict[str, str]:
 
 
 async def parse_all_cabinets() -> List[Dict]:
-    """Парсит артикулы и названия товаров по всем 6 кабинетам через официальное API.
+    """Парсит все поля карточек товаров по всем 6 кабинетам через официальное API.
     
     Returns:
-        Список всех артикулов со всех кабинетов
+        Список всех карточек со всеми полями
     """
     # Получаем токены для всех кабинетов
     api_tokens = get_api_tokens()
@@ -309,19 +334,19 @@ async def parse_all_cabinets() -> List[Dict]:
         return []
     
     logger.info("=" * 70)
-    logger.info("🚀 НАЧАЛО ПАРСИНГА АРТИКУЛОВ И НАЗВАНИЙ ТОВАРОВ ПО ВСЕМ КАБИНЕТАМ")
+    logger.info("🚀 НАЧАЛО ПАРСИНГА ВСЕХ ПОЛЕЙ КАРТОЧЕК ТОВАРОВ ПО ВСЕМ КАБИНЕТАМ")
     logger.info("=" * 70)
     logger.info(f"📋 Кабинетов для обработки: {len(api_tokens)}")
     logger.info(f"🔑 Найдено токенов: {len(api_tokens)}")
     logger.info("")
     
-    all_articles = []
+    all_cards = []
     start_time = datetime.now()
     
     # Парсим кабинеты последовательно (соблюдаем rate limits)
     for cabinet_name, api_token in api_tokens.items():
-        cabinet_articles = await parse_cabinet_articles(api_token, cabinet_name)
-        all_articles.extend(cabinet_articles)
+        cabinet_cards = await parse_cabinet_articles(api_token, cabinet_name)
+        all_cards.extend(cabinet_cards)
         logger.info("")  # Пустая строка для разделения
         
         # Небольшая задержка между кабинетами
@@ -331,21 +356,21 @@ async def parse_all_cabinets() -> List[Dict]:
     
     logger.info("=" * 70)
     logger.success(f"✅ ПАРСИНГ ЗАВЕРШЕН")
-    logger.info(f"📊 Всего получено артикулов: {len(all_articles)}")
+    logger.info(f"📊 Всего получено карточек: {len(all_cards)}")
     logger.info(f"⏱️  Время выполнения: {total_time:.2f} сек")
     logger.info("=" * 70)
     
-    return all_articles
+    return all_cards
 
 
-def save_to_excel(articles: List[Dict], output_file: Path):
-    """Сохраняет артикулы и названия товаров в Excel файл.
+def save_to_excel(cards: List[Dict], output_file: Path):
+    """Сохраняет все поля карточек в Excel файл.
     
     Args:
-        articles: Список словарей с артикулами и названиями
+        cards: Список словарей со всеми полями карточек
         output_file: Путь к файлу для сохранения
     """
-    if not articles:
+    if not cards:
         logger.warning("⚠️ Нет данных для сохранения")
         return
     
@@ -353,33 +378,28 @@ def save_to_excel(articles: List[Dict], output_file: Path):
         import pandas as pd
         from openpyxl.utils import get_column_letter
         
-        logger.info(f"💾 Сохраняем {len(articles)} записей в {output_file}...")
+        logger.info(f"💾 Сохраняем {len(cards)} записей в {output_file}...")
         
         # Создаем DataFrame
-        df = pd.DataFrame(articles)
+        df = pd.DataFrame(cards)
         
-        # Переименовываем столбцы для читаемости
-        rename_mapping = {
-            "nm_id": "Артикул",
-            "product_name": "Название товара",
-            "cabinet_id": "ID кабинета",
-            "cabinet_name": "Кабинет"
-        }
+        # Определяем порядок столбцов (важные поля сначала)
+        important_columns = [
+            "cabinet_name", "cabinet_id", "nmID", "subjectName", "title", 
+            "vendorCode", "brand", "subjectID", "sizes_count", "sizes_details"
+        ]
         
-        for old_name, new_name in rename_mapping.items():
-            if old_name in df.columns:
-                df = df.rename(columns={old_name: new_name})
-        
-        # Определяем порядок столбцов
-        column_order = ["Артикул", "Название товара", "Кабинет", "ID кабинета"]
-        df = df[[col for col in column_order if col in df.columns]]
+        # Сортируем столбцы: сначала важные, потом остальные
+        other_columns = [col for col in df.columns if col not in important_columns]
+        column_order = [col for col in important_columns if col in df.columns] + sorted(other_columns)
+        df = df[column_order]
         
         # Сохраняем в Excel
         with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Articles')
+            df.to_excel(writer, index=False, sheet_name='AllCards')
             
             # Настраиваем ширину столбцов
-            worksheet = writer.sheets['Articles']
+            worksheet = writer.sheets['AllCards']
             for idx, col in enumerate(df.columns, 1):
                 column_letter = get_column_letter(idx)
                 
@@ -389,26 +409,26 @@ def save_to_excel(articles: List[Dict], output_file: Path):
                     len(str(col))  # Длина заголовка
                 )
                 
-                # Устанавливаем ширину (с небольшим запасом)
-                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 100)
+                # Устанавливаем ширину (с небольшим запасом, но не слишком широко)
+                worksheet.column_dimensions[column_letter].width = min(max_length + 2, 50)
         
         logger.success(f"✅ Файл сохранен: {output_file}")
-        logger.info(f"📊 Всего записей: {len(articles)}")
+        logger.info(f"📊 Всего записей: {len(cards)}")
+        logger.info(f"📋 Всего столбцов: {len(df.columns)}")
         
         # Статистика по кабинетам
-        if "Кабинет" in df.columns:
-            cabinet_stats = df["Кабинет"].value_counts()
+        if "cabinet_name" in df.columns:
+            cabinet_stats = df["cabinet_name"].value_counts()
             logger.info("📈 Статистика по кабинетам:")
             for cabinet, count in cabinet_stats.items():
-                logger.info(f"   • {cabinet}: {count} артикулов")
+                logger.info(f"   • {cabinet}: {count} карточек")
         
-        # Проверка на дубликаты артикулов
-        if "Артикул" in df.columns:
-            duplicates = df[df.duplicated(subset=["Артикул"], keep=False)]
-            if not duplicates.empty:
-                logger.warning(f"⚠️ Найдено {len(duplicates)} дубликатов артикулов (товары в нескольких кабинетах)")
-            else:
-                logger.info("✅ Дубликатов артикулов не найдено")
+        # Статистика по наличию (sizes_count)
+        if "sizes_count" in df.columns:
+            no_sizes = df[df["sizes_count"] == 0]
+            with_sizes = df[df["sizes_count"] > 0]
+            logger.info(f"📦 Товаров без размеров (sizes_count=0): {len(no_sizes)}")
+            logger.info(f"📦 Товаров с размерами (sizes_count>0): {len(with_sizes)}")
     
     except ImportError:
         logger.error("❌ Ошибка: не установлены необходимые библиотеки")
@@ -424,15 +444,16 @@ async def main():
     """Главная функция парсера."""
     try:
         # Парсим все кабинеты
-        all_articles = await parse_all_cabinets()
+        all_cards = await parse_all_cabinets()
         
-        if not all_articles:
-            logger.error("❌ Не получено ни одного артикула. Проверьте настройки и доступность API.")
+        if not all_cards:
+            logger.error("❌ Не получено ни одной карточки. Проверьте настройки и доступность API.")
             return
         
-        # Сохраняем в Articles.xlsx
-        output_file = project_root / "Articles.xlsx"
-        save_to_excel(all_articles, output_file)
+        # Сохраняем в отдельный Excel файл для анализа
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = project_root / f"Articles_Debug_{timestamp}.xlsx"
+        save_to_excel(all_cards, output_file)
         
         logger.success("=" * 70)
         logger.success("✅ ПАРСИНГ УСПЕШНО ЗАВЕРШЕН")
